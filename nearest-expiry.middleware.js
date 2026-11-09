@@ -1,0 +1,96 @@
+// magpie 路由策略：nearest-expiry —— 会作废的额度最先烧。
+// 排序：正常成员按有效窗口 min(soon) 截断到小时升序 → 同小时 used 高的在前
+//       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
+// 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
+//   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
+//   真实失效批次（runsOutAt/runsOut）自动升档；计数器型短窗仍靠 FIXES 跳过。
+// seat 字段（points.go seatJSON）：{ key, account, known, learns, used, soon[], pace, weight, resting, tokens }
+// 返回：seats 的索引排列，只定顺序；候选集、rest、failover 仍由 magpie 核心处理。
+
+const SOON_SKIP = 2 * 3600 * 1000; // 默认忽略 2 小时内到期的窗口（判定为重置型）
+const MIN_RUNSOUT = 20; // 小于此量的过期批次不值得打乱排序
+const FIXES = [
+  // skipHours: 假窗口/计数器，吃掉短 resetsAt；daily: 数据面缺失的每日真蛋糕
+  { prefix: 'workbuddy', skipHours: 36 }, // deepseek tokens (est.) 是用量计数器，真池=月度 Credits
+  { prefix: 'opencode-go', skipHours: 6 }, // 5h 速率窗不参与排序，按 7d/月窗排（烧=纯赚）
+  { prefix: 'marvis', daily: true }, // 每日 10M tokens 的额度，00:00 刷新，数据面无 resetsAt
+];
+// 全量窗口账本，由 sync-expiry.hooks.js 每 30 分钟从 /v1/magpie/quotas 注入。
+// 结构：{ provider前缀: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选)}, ... ] }
+// 发布版本只保留空占位块；运行时账本、日志、账号信息均不提交到仓库。
+const AUTO_BOOK = {
+/*AUTO-BOOK-BEGIN*/
+/*AUTO-BOOK-END*/
+};
+
+export const strategies = {
+  'nearest-expiry': (pool, seats, options) => {
+    const HOUR = 3600 * 1000;
+    let now = 0;
+    try { now = Date.now(); } catch (e) { now = 0; }
+    const bookKeys = Object.keys(AUTO_BOOK);
+    const rank = [];
+    for (let i = 0; i < seats.length; i++) {
+      const s = seats[i] || {};
+      let fix = null;
+      let book = null;
+      if (typeof s.key === 'string') {
+        for (let f = 0; f < FIXES.length; f++) {
+          if (s.key.indexOf(FIXES[f].prefix) === 0) { fix = FIXES[f]; break; }
+        }
+        for (let b = 0; b < bookKeys.length; b++) {
+          if (s.key.indexOf(bookKeys[b]) === 0) { book = AUTO_BOOK[bookKeys[b]]; break; }
+        }
+      }
+      let skipMs = SOON_SKIP;
+      if (fix && fix.skipHours) skipMs = fix.skipHours * 3600 * 1000;
+      let soonMin = 0; // 0 = 无到期数据
+      let soonMinKeep = 0; // 不过滤时的最小值（全被过滤则回退用）
+      const soon = s.soon;
+      if (soon && soon.length) {
+        for (let j = 0; j < soon.length; j++) {
+          const t = soon[j];
+          if (typeof t !== 'number' || t <= 0) continue;
+          if (soonMinKeep === 0 || t < soonMinKeep) soonMinKeep = t;
+          if (now > 0 && t - now < skipMs) continue; // 计数器/重置型短窗口，有更晚窗口时忽略
+          if (soonMin === 0 || t < soonMin) soonMin = t;
+        }
+        if (soonMin === 0) soonMin = soonMinKeep; // 全是短窗口：照常参与排序
+      }
+      // 账本里的真实失效批次（runsOutAt）与到期窗口（resetsAt）取最早者。
+      // 重置型短窗同样受 skipMs 过滤（与 soon 一致），但真失效批次(o)豁免——
+      // 它是会作废的额度，不能因为临近就被当成重置窗忽略。
+      if (book && book.length && now > 0) {
+        for (let w = 0; w < book.length; w++) {
+          const e = book[w];
+          if (!e || typeof e.r !== 'number' || e.r <= now) continue;
+          if (e.o && e.o < MIN_RUNSOUT) continue;
+          if (!e.o && e.r - now < skipMs) continue;
+          if (soonMin === 0 || e.r < soonMin) soonMin = e.r;
+        }
+      }
+      if (fix && fix.daily && now > 0) {
+        // 每日 00:00 重置的真蛋糕，数据面缺失时注入伪窗口
+        try {
+          const d = new Date(now);
+          const next = new Date(d.getFullYear(), d.getMonth(), d.getDate() + 1, 0, 0, 0, 0).getTime();
+          if (soonMin === 0 || next < soonMin) soonMin = next;
+        } catch (e) { /* moejs 无 Date 构造器则放弃注入 */ }
+      }
+      const spent = (s.resting === true) || (s.known === true && typeof s.used === 'number' && s.used >= 98);
+      // 排序键：spent 垫底；有到期数据的在前，按小时升序；无数据的排在其后
+      const group = spent ? 2 : soonMin > 0 ? 0 : 1;
+      const hourKey = soonMin > 0 ? Math.floor(soonMin / HOUR) : 0;
+      rank.push({ i: i, group: group, hourKey: hourKey, used: typeof s.used === 'number' ? s.used : 0 });
+    }
+    rank.sort((a, b) => {
+      if (a.group !== b.group) return a.group - b.group;
+      if (a.hourKey !== b.hourKey) return a.hourKey - b.hourKey;
+      if (a.used !== b.used) return b.used - a.used; // 同小时：快用完的先烧
+      return a.i - b.i;
+    });
+    const order = [];
+    for (let k = 0; k < rank.length; k++) order.push(rank[k].i);
+    return order;
+  },
+};
