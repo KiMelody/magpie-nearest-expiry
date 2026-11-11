@@ -3,9 +3,13 @@
 // 同目录 nearest-expiry.middleware.js 的 AUTO_BOOK 块（mtime 变化触发热重载）。
 // 数据形状：data[] = {provider, user, windows:[{name, used, remaining,
 //   resetsAt, runsOutAt, runsOut, amount, limit, unit, holdsWhy, display}]}
-// 注入结构：{ provider前缀: [ {r: unix ms, o?: runsOut}, ... ] }
+// 注入结构：{ 账号键: [ {r: unix ms, o?: runsOut}, ... ] }
+//   账号键 = 同一 provider 首次出现用裸 provider，其余用 provider@user，
+//   与 magpie 的 seat key 对应；策略按精确匹配 + 最长前缀回退查表。
 //   r = runsOutAt（真失效批次）优先，否则 resetsAt（到期重置窗）；
 //   o = runsOut（过期量），仅 runsOutAt 带；策略按 MIN_RUNSOUT 过滤小批次。
+// codearts 的总积分会把已耗尽的限时批次仍算作即将失效，故只认
+//   赠送/按需积分包里 remaining>0 的批次；没有有效批次时退回月度重置窗。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 导出的 onRequest 是空操作直通，仅用于让宿主识别并常驻本模块 —— 定时器在模块顶层。
 import {
@@ -63,33 +67,53 @@ async function sync() {
   if (!data || !Array.isArray(data.data)) return;
   const now = Date.now();
   const book = {};
+  const seen = new Set();
   for (const p of data.data) {
     if (!p || typeof p.provider !== 'string') continue;
+    // 与 magpie 的 seat key 对齐：同 provider 第一张卡用裸 id，其余用 id@user
+    const first = !seen.has(p.provider);
+    seen.add(p.provider);
+    const key = first || !p.user ? p.provider : `${p.provider}@${p.user}`;
+    const windows = p.windows || [];
+    let candidates;
+    if (p.provider === 'codearts') {
+      // 总积分窗口会把已耗尽的签到批次仍算作即将失效；只认限时分桶的剩余量。
+      // 限时积分烧完后退回月度重置窗，且不带 o（这不是会作废的批次）。
+      const timed = windows.filter((w) => w &&
+        (w.name === '赠送积分包' || w.name === '按需积分包') &&
+        w.runsOutAt && Number(w.remaining) > 0);
+      if (timed.length) {
+        candidates = timed.map((w) => ({ at: w.runsOutAt, out: w.runsOut }));
+      } else {
+        const monthly = windows.find((w) => w && w.name === '基础积分包') ||
+                        windows.find((w) => w && w.name === '总积分');
+        candidates = monthly && monthly.resetsAt ? [{ at: monthly.resetsAt }] : [];
+      }
+    } else {
+      candidates = windows
+        .filter((w) => w && (w.runsOutAt || w.resetsAt))
+        .map((w) => ({ at: w.runsOutAt || w.resetsAt, out: w.runsOutAt ? w.runsOut : undefined }));
+    }
     const rows = [];
-    for (const w of p.windows || []) {
-      if (!w) continue;
-      const isExpiry = !!w.runsOutAt;
-      const raw = isExpiry ? w.runsOutAt : w.resetsAt;
-      if (!raw) continue;
-      const ms = Date.parse(raw);
+    for (const c of candidates) {
+      const ms = Date.parse(c.at);
       if (!Number.isFinite(ms)) continue;
       const dt = ms - now;
       if (dt < MIN_MS || dt > MAX_MS) continue;
-      const o = isExpiry ? Number(w.runsOut) : undefined;
-      if (isExpiry && Number.isFinite(o) && o < MIN_RUNSOUT) continue;
+      const o = c.out === undefined ? undefined : Number(c.out);
+      if (o !== undefined && Number.isFinite(o) && o < MIN_RUNSOUT) continue;
       const row = { r: ms };
-      if (isExpiry && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
+      if (o !== undefined && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
       rows.push(row);
     }
-    if (rows.length) {
-      // 同一 provider 可能有多个账号，必须合并不能覆盖
-      if (!book[p.provider]) book[p.provider] = [];
-      book[p.provider].push(...rows);
+    if (!rows.length) continue;
+    // 同一时刻的重复批次去重，保留带 o 的记录
+    const byTime = new Map();
+    for (const row of rows) {
+      const prev = byTime.get(row.r);
+      if (!prev || (row.o !== undefined && prev.o === undefined)) byTime.set(row.r, row);
     }
-  }
-  for (const k of Object.keys(book)) {
-    book[k].sort((a, b) => a.r - b.r);
-    book[k] = book[k].slice(0, 12); // 控体积，留足多账号窗口
+    book[key] = [...byTime.values()].sort((a, b) => a.r - b.r).slice(0, 12);
   }
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
   const stamp = new Date(now).toISOString().replace('T', ' ').slice(5, 16);
@@ -99,9 +123,9 @@ async function sync() {
   const re = /\/\*AUTO-BOOK-BEGIN\*\/[\s\S]*?\/\*AUTO-BOOK-END\*\//;
   if (!re.test(content)) { log('AUTO_BOOK block not found'); return; }
   const next = content.replace(re, block);
-  if (next === content) { log(`no change (${lines.length} providers)`); return; }
+  if (next === content) { log(`no change (${lines.length} accounts)`); return; }
   try { atomicWrite(PLUGIN, next); } catch (e) { log(`write failed: ${e.message}`); return; }
-  log(`synced: ${lines.length} providers`);
+  log(`synced: ${lines.length} accounts`);
 }
 
 let busy = false;

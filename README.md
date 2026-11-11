@@ -7,8 +7,10 @@ A magpie directory plugin that registers a routing strategy named `nearest-expir
 The strategy prefers candidate seats whose allowance is lost soonest. It combines:
 
 - the seat data magpie exposes to JavaScript strategies (`soon`, `used`, `resting`, and related fields);
-- a compact `AUTO_BOOK` injected into the middleware entry file from `/v1/magpie/quotas`;
+- a compact account-scoped `AUTO_BOOK` injected into the middleware entry file from `/v1/magpie/quotas`;
 - a few provider-specific semantic fixes for counters and unmetered daily allowances.
+
+Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, only timed credit buckets with remaining balance are treated as expiring allowances; once those are spent, the monthly reset is used instead of the stale aggregate `runsOut` field.
 
 The hooks entry runs a lightweight 30-minute timer inside magpie's plugin host. It has no model-facing tools and does not change request bodies; it only refreshes the middleware source block so magpie hot-reloads the strategy.
 

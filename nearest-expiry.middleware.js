@@ -16,8 +16,9 @@ const FIXES = [
   { prefix: 'marvis', daily: true }, // 每日 10M tokens 的额度，00:00 刷新，数据面无 resetsAt
 ];
 // 全量窗口账本，由 sync-expiry.hooks.js 每 30 分钟从 /v1/magpie/quotas 注入。
-// 结构：{ provider前缀: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选)}, ... ] }
-// 发布版本只保留空占位块；运行时账本、日志、账号信息均不提交到仓库。
+// 结构：{ 账号键: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选)}, ... ] }
+// 账号键与 seat.key 对齐；命中账本后不再合并 s.soon，避免已耗尽的失效批次
+// 从 seat 的 lapse/soon 里回流，绕过同步侧的修正。
 const AUTO_BOOK = {
 /*AUTO-BOOK-BEGIN*/
 /*AUTO-BOOK-END*/
@@ -38,15 +39,25 @@ export const strategies = {
         for (let f = 0; f < FIXES.length; f++) {
           if (s.key.indexOf(FIXES[f].prefix) === 0) { fix = FIXES[f]; break; }
         }
-        for (let b = 0; b < bookKeys.length; b++) {
-          if (s.key.indexOf(bookKeys[b]) === 0) { book = AUTO_BOOK[bookKeys[b]]; break; }
+        // 优先按账号键精确命中；新出现的账号回退到最长 provider 前缀
+        if (Object.prototype.hasOwnProperty.call(AUTO_BOOK, s.key)) {
+          book = AUTO_BOOK[s.key];
+        } else {
+          let best = '';
+          for (let b = 0; b < bookKeys.length; b++) {
+            const k = bookKeys[b];
+            if (s.key.indexOf(k) === 0 && k.length > best.length) best = k;
+          }
+          if (best) book = AUTO_BOOK[best];
         }
       }
       let skipMs = SOON_SKIP;
       if (fix && fix.skipHours) skipMs = fix.skipHours * 3600 * 1000;
       let soonMin = 0; // 0 = 无到期数据
       let soonMinKeep = 0; // 不过滤时的最小值（全被过滤则回退用）
-      const soon = s.soon;
+      // 账本已经按账号给出可信窗口时，忽略 seat 自带的 soon/lapse：
+      // codearts 总积分会把已耗尽的限时批次仍算作即将失效。
+      const soon = book ? null : s.soon;
       if (soon && soon.length) {
         for (let j = 0; j < soon.length; j++) {
           const t = soon[j];

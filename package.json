@@ -1,6 +1,6 @@
 {
   "name": "middleware-nearest-expiry",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "A magpie routing strategy that burns the allowance expiring soonest first, with a hooks-based quota-book sync.",
   "license": "MIT",
   "files": [
