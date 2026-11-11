@@ -8,8 +8,9 @@
 //   与 magpie 的 seat key 对应；策略按精确匹配 + 最长前缀回退查表。
 //   r = runsOutAt（真失效批次）优先，否则 resetsAt（到期重置窗）；
 //   o = runsOut（过期量），仅 runsOutAt 带；策略按 MIN_RUNSOUT 过滤小批次。
-// codearts 的总积分会把已耗尽的限时批次仍算作即将失效，故只认
-//   赠送/按需积分包里 remaining>0 的批次；没有有效批次时退回月度重置窗。
+// codearts 的赠送/按需积分包把整桶长时效余额配上某个签到子批次的过期时间，
+//   且台账回退会让已耗尽的签到批次一直算有效；只有厂商在 display 里标出
+//   即将过期的积分量时才认这个失效批次，否则退回月度重置窗。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
 // 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
@@ -82,13 +83,20 @@ async function sync() {
     const windows = p.windows || [];
     let candidates;
     if (p.provider === 'codearts') {
-      // 总积分窗口会把已耗尽的签到批次仍算作即将失效；只认限时分桶的剩余量。
-      // 限时积分烧完后退回月度重置窗，且不带 o（这不是会作废的批次）。
-      const timed = windows.filter((w) => w &&
-        (w.name === '赠送积分包' || w.name === '按需积分包') &&
-        w.runsOutAt && Number(w.remaining) > 0);
+      // 厂商统计侧的即将过期标记：只有它出现，才说明还有会作废的签到限额。
+      // 赠送积分包的 runsOutAt 描述的是签到子批次，remaining 却是整桶长时效余额，
+      // 台账回退又让已烧完的批次一直算有效，故 runsOutAt 单独出现不可信。
+      const hasExpiring = windows.some((w) => w &&
+        typeof w.display === 'string' && w.display.indexOf('即将过期') >= 0);
+      const timed = hasExpiring
+        ? windows.filter((w) => w &&
+            (w.name === '赠送积分包' || w.name === '按需积分包') &&
+            w.runsOutAt && Number(w.remaining) > 0)
+            .map((w) => ({ at: w.runsOutAt, out: w.runsOut }))
+        : [];
+      // 没有有效签到限额时退回月度重置窗，且不带 o（这不是会作废的批次）。
       if (timed.length) {
-        candidates = timed.map((w) => ({ at: w.runsOutAt, out: w.runsOut }));
+        candidates = timed;
       } else {
         const monthly = windows.find((w) => w && w.name === '基础积分包') ||
                         windows.find((w) => w && w.name === '总积分');

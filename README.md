@@ -14,7 +14,7 @@ Candidates are ordered by their exact earliest expiry timestamp. The used percen
 
 The hooks write the ledger only when its content changes, avoiding a periodic timestamp that would otherwise reload the middleware and clear rotation state every 30 minutes. Short rate-limit windows computed relative to the current time are excluded, and timestamps and loss amounts are rounded, so routine quota reads keep producing the same ledger.
 
-Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, only timed credit buckets with remaining balance are treated as expiring allowances; once those are spent, the monthly reset is used instead of the stale aggregate `runsOut` field.
+Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, a timed credit bucket is trusted only when the vendor also reports an expiring amount; a short-lived check-in batch's timestamp paired with the whole long-lived bucket's balance is not taken as proof that the balance lapses with it. When no expiring amount is reported, the monthly reset is used instead.
 
 The hooks entry runs a lightweight 30-minute timer inside magpie's plugin host. It has no model-facing tools and does not change request bodies; it only refreshes the middleware source block so magpie hot-reloads the strategy.
 
