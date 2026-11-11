@@ -1,5 +1,5 @@
 // magpie 路由策略：nearest-expiry —— 会作废的额度最先烧。
-// 排序：正常成员按有效窗口 min(soon) 截断到小时升序 → 同小时 used 高的在前
+// 排序：正常成员按有效窗口 min(soon) 的精确时间戳升序 → 同一时刻才用 used 决胜
 //       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
 // 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
 //   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
@@ -26,7 +26,6 @@ const AUTO_BOOK = {
 
 export const strategies = {
   'nearest-expiry': (pool, seats, options) => {
-    const HOUR = 3600 * 1000;
     let now = 0;
     try { now = Date.now(); } catch (e) { now = 0; }
     const bookKeys = Object.keys(AUTO_BOOK);
@@ -89,15 +88,14 @@ export const strategies = {
         } catch (e) { /* moejs 无 Date 构造器则放弃注入 */ }
       }
       const spent = (s.resting === true) || (s.known === true && typeof s.used === 'number' && s.used >= 98);
-      // 排序键：spent 垫底；有到期数据的在前，按小时升序；无数据的排在其后
+      // 排序键：spent 垫底；有到期数据的在前，按精确时刻升序；无数据的排在其后
       const group = spent ? 2 : soonMin > 0 ? 0 : 1;
-      const hourKey = soonMin > 0 ? Math.floor(soonMin / HOUR) : 0;
-      rank.push({ i: i, group: group, hourKey: hourKey, used: typeof s.used === 'number' ? s.used : 0 });
+      rank.push({ i: i, group: group, soon: soonMin, used: typeof s.used === 'number' ? s.used : 0 });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
-      if (a.hourKey !== b.hourKey) return a.hourKey - b.hourKey;
-      if (a.used !== b.used) return b.used - a.used; // 同小时：快用完的先烧
+      if (a.soon !== b.soon) return a.soon - b.soon; // 精确到期时刻升序
+      if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同一时刻：快用完的先烧
       return a.i - b.i;
     });
     const order = [];
