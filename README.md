@@ -12,7 +12,7 @@ The strategy prefers candidate seats whose allowance is lost soonest. It combine
 
 Candidates are ordered by their exact earliest expiry timestamp. The used percentage only breaks ties between candidates expiring at exactly the same timestamp; rounding expiries into hour buckets is deliberately avoided, since a minute-scale difference can otherwise be inverted by unrelated usage percentages. Candidates whose expiry falls within five minutes of the earliest are treated as one band and rotated per group, so minute-scale differences do not pin every turn to the same account. Rotation state lives in the strategy's module scope and is keyed by pool; it resets when the middleware reloads because quota data changed.
 
-The hooks write the ledger only when its content changes, avoiding a periodic timestamp that would otherwise reload the middleware and clear rotation state every 30 minutes.
+The hooks write the ledger only when its content changes, avoiding a periodic timestamp that would otherwise reload the middleware and clear rotation state every 30 minutes. Short rate-limit windows computed relative to the current time are excluded, and timestamps and loss amounts are rounded, so routine quota reads keep producing the same ledger.
 
 Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, only timed credit buckets with remaining balance are treated as expiring allowances; once those are spent, the monthly reset is used instead of the stale aggregate `runsOut` field.
 

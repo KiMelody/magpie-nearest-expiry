@@ -11,6 +11,11 @@
 // codearts 的总积分会把已耗尽的限时批次仍算作即将失效，故只认
 //   赠送/按需积分包里 remaining>0 的批次；没有有效批次时退回月度重置窗。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
+// 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
+// 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
+// r 按 5 分钟对齐、o 取整，进一步容忍供应商读数抖动。
+const ROUND_MS = 5 * 60 * 1000;
+const SHORT_WINDOW = /5\s*(hours|hour|h|小时)/i;
 // 导出的 onRequest 是空操作直通，仅用于让宿主识别并常驻本模块 —— 定时器在模块顶层。
 import {
   appendFileSync,
@@ -91,7 +96,8 @@ async function sync() {
       }
     } else {
       candidates = windows
-        .filter((w) => w && (w.runsOutAt || w.resetsAt))
+        .filter((w) => w && (w.runsOutAt || w.resetsAt) &&
+          !SHORT_WINDOW.test(String(w.name || '')))
         .map((w) => ({ at: w.runsOutAt || w.resetsAt, out: w.runsOutAt ? w.runsOut : undefined }));
     }
     const rows = [];
@@ -110,9 +116,11 @@ async function sync() {
       rows.push(row);
     }
     if (!rows.length) continue;
-    // 同一时刻的重复批次去重，保留带 o 的记录
+    // 同一时刻的重复批次去重，保留带 o 的记录；r 对齐到 5 分钟、o 取整
     const byTime = new Map();
     for (const row of rows) {
+      row.r = Math.floor(row.r / ROUND_MS) * ROUND_MS;
+      if (row.o !== undefined) row.o = Math.round(row.o);
       const prev = byTime.get(row.r);
       if (!prev || (row.o !== undefined && prev.o === undefined)) byTime.set(row.r, row);
     }
