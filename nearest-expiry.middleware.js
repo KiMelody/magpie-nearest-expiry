@@ -20,7 +20,8 @@ const FIXES = [
   { prefix: 'marvis', daily: true }, // 每日 10M tokens 的额度，00:00 刷新，数据面无 resetsAt
 ];
 // 全量窗口账本，由 sync-expiry.hooks.js 每 30 分钟从 /v1/magpie/quotas 注入。
-// 结构：{ 账号键: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选)}, ... ] }
+// 结构：{ 账号键: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选),
+//   d: 每日签到限额(可选)}, ... ] }
 // 账号键与 seat.key 对齐；命中账本后不再合并 s.soon，避免已耗尽的失效批次
 // 从 seat 的 lapse/soon 里回流，绕过同步侧的修正。
 const AUTO_BOOK = {
@@ -71,15 +72,15 @@ export const strategies = {
         }
         if (soonMin === 0) soonMin = soonMinKeep; // 全是短窗口：照常参与排序
       }
-      // 账本里的真实失效批次（runsOutAt）与到期窗口（resetsAt）取最早者。
-      // 重置型短窗同样受 skipMs 过滤（与 soon 一致），但真失效批次(o)豁免——
-      // 它是会作废的额度，不能因为临近就被当成重置窗忽略。
+      // 账本里的真实失效批次（runsOutAt）、每日签到窗(d)与到期窗口
+      // （resetsAt）取最早者。真失效批次与每日签到窗豁免 skipMs：它们是会
+      // 作废的额度，不能因为临近就被当成重置窗忽略。
       if (book && book.length && now > 0) {
         for (let w = 0; w < book.length; w++) {
           const e = book[w];
           if (!e || typeof e.r !== 'number' || e.r <= now) continue;
           if (e.o && e.o < MIN_RUNSOUT) continue;
-          if (!e.o && e.r - now < skipMs) continue;
+          if (!e.o && !e.d && e.r - now < skipMs) continue;
           if (soonMin === 0 || e.r < soonMin) soonMin = e.r;
         }
       }

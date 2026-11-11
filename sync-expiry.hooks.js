@@ -8,6 +8,8 @@
 //   与 magpie 的 seat key 对应；策略按精确匹配 + 最长前缀回退查表。
 //   r = runsOutAt（真失效批次）优先，否则 resetsAt（到期重置窗）；
 //   o = runsOut（过期量），仅 runsOutAt 带；策略按 MIN_RUNSOUT 过滤小批次。
+//   d = 每日签到限额：供应商给的是 resetsAt，但它当天作废而非重置，
+//       打标记让同步侧豁免 2h 保护、策略侧豁免 skipMs；已烧完的不进账本。
 // codearts 的赠送/按需积分包把整桶长时效余额配上某个签到子批次的过期时间，
 //   且台账回退会让已耗尽的签到批次一直算有效；只有厂商在 display 里标出
 //   即将过期的积分量时才认这个失效批次，否则退回月度重置窗。
@@ -17,6 +19,7 @@
 // r 按 5 分钟对齐、o 取整，进一步容忍供应商读数抖动。
 const ROUND_MS = 5 * 60 * 1000;
 const SHORT_WINDOW = /5\s*(hours|hour|h|小时)/i;
+const DAILY_WINDOW = /每日签到/;
 // 导出的 onRequest 是空操作直通，仅用于让宿主识别并常驻本模块 —— 定时器在模块顶层。
 import {
   appendFileSync,
@@ -106,7 +109,13 @@ async function sync() {
       candidates = windows
         .filter((w) => w && (w.runsOutAt || w.resetsAt) &&
           !SHORT_WINDOW.test(String(w.name || '')))
-        .map((w) => ({ at: w.runsOutAt || w.resetsAt, out: w.runsOutAt ? w.runsOut : undefined }));
+        .map((w) => ({
+          at: w.runsOutAt || w.resetsAt,
+          out: w.runsOutAt ? w.runsOut : undefined,
+          // 每日签到限额给的是 resetsAt，语义上却是当天作废；仅对仍有余额的
+          // 重置型窗口打标记，让下游按会作废处理，不与真失效批次混拼。
+          daily: !w.runsOutAt && DAILY_WINDOW.test(String(w.name || '')) && Number(w.remaining) > 0,
+        }));
     }
     const rows = [];
     for (const c of candidates) {
@@ -116,21 +125,23 @@ async function sync() {
       if (dt > MAX_MS) continue;
       const o = c.out === undefined ? undefined : Number(c.out);
       if (o !== undefined && Number.isFinite(o) && o < MIN_RUNSOUT) continue;
-      // 真失效批次(o)豁免 MIN_MS：临近失效时仍要保留，否则会从账本消失。
-      // 重置型短窗仍需过 2h 保护，避免计数器/速率窗抢排序。
-      if (dt < MIN_MS && (o === undefined || !Number.isFinite(o))) continue;
+      // 真失效批次(o)与每日签到窗(d)豁免 MIN_MS：临近失效时仍要保留，
+      // 否则会从账本消失。重置型短窗仍需过 2h 保护，避免计数器/速率窗抢排序。
+      if (dt < MIN_MS && !c.daily && (o === undefined || !Number.isFinite(o))) continue;
       const row = { r: ms };
       if (o !== undefined && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
+      if (c.daily) row.d = 1;
       rows.push(row);
     }
     if (!rows.length) continue;
-    // 同一时刻的重复批次去重，保留带 o 的记录；r 对齐到 5 分钟、o 取整
+    // 同一时刻的重复批次去重，优先保留信息量更大的记录；r 对齐到 5 分钟、o 取整
+    const weight = (r) => (r.d ? 2 : 0) + (r.o !== undefined ? 1 : 0);
     const byTime = new Map();
     for (const row of rows) {
       row.r = Math.floor(row.r / ROUND_MS) * ROUND_MS;
       if (row.o !== undefined) row.o = Math.round(row.o);
       const prev = byTime.get(row.r);
-      if (!prev || (row.o !== undefined && prev.o === undefined)) byTime.set(row.r, row);
+      if (!prev || weight(row) > weight(prev)) byTime.set(row.r, row);
     }
     book[key] = [...byTime.values()].sort((a, b) => a.r - b.r).slice(0, 12);
   }

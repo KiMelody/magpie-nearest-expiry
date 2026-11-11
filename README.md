@@ -16,6 +16,8 @@ The hooks write the ledger only when its content changes, avoiding a periodic ti
 
 Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, a timed credit bucket is trusted only when the vendor also reports an expiring amount; a short-lived check-in batch's timestamp paired with the whole long-lived bucket's balance is not taken as proof that the balance lapses with it. When no expiring amount is reported, the monthly reset is used instead.
 
+Some providers describe a daily check-in allowance with `resetsAt`, even though the credits are lost at that time rather than renewed. A window whose name marks it as a daily check-in and still holds a positive balance gets a `d` flag in the ledger, which exempts it from the short-window filter so it stays eligible until it actually expires. Empty check-in windows are left out.
+
 The hooks entry runs a lightweight 30-minute timer inside magpie's plugin host. It has no model-facing tools and does not change request bodies; it only refreshes the middleware source block so magpie hot-reloads the strategy.
 
 ## Install
