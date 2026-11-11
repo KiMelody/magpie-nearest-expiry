@@ -1,5 +1,6 @@
 // magpie 路由策略：nearest-expiry —— 会作废的额度最先烧。
-// 排序：正常成员按有效窗口 min(soon) 的精确时间戳升序 → 同一时刻才用 used 决胜
+// 排序：正常成员按有效窗口 min(soon) 的精确时间戳升序 → 最早到期后 BAND_MS 内的
+//       候选视作同一档，在档内按组轮换 → 同一时刻才用 used 决胜
 //       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
 // 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
 //   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
@@ -9,6 +10,9 @@
 
 const SOON_SKIP = 2 * 3600 * 1000; // 默认忽略 2 小时内到期的窗口（判定为重置型）
 const MIN_RUNSOUT = 20; // 小于此量的过期批次不值得打乱排序
+const BAND_MS = 5 * 60 * 1000; // 到期时间相差 5 分钟内视作同一档，档内轮换
+// 按 pool 记住档内上一次选中的 key；模块常驻，热重载会清零（额度数据变了本就该重排）。
+const cursors = {};
 const FIXES = [
   // skipHours: 假窗口/计数器，吃掉短 resetsAt；daily: 数据面缺失的每日真蛋糕
   { prefix: 'workbuddy', skipHours: 36 }, // deepseek tokens (est.) 是用量计数器，真池=月度 Credits
@@ -90,7 +94,8 @@ export const strategies = {
       const spent = (s.resting === true) || (s.known === true && typeof s.used === 'number' && s.used >= 98);
       // 排序键：spent 垫底；有到期数据的在前，按精确时刻升序；无数据的排在其后
       const group = spent ? 2 : soonMin > 0 ? 0 : 1;
-      rank.push({ i: i, group: group, soon: soonMin, used: typeof s.used === 'number' ? s.used : 0 });
+      const key = typeof s.key === 'string' ? s.key : `#${i}`;
+      rank.push({ i: i, group: group, soon: soonMin, used: typeof s.used === 'number' ? s.used : 0, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
@@ -98,6 +103,30 @@ export const strategies = {
       if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同一时刻：快用完的先烧
       return a.i - b.i;
     });
+
+    // 正常候选里，最早到期后 BAND_MS 内的视作同一档；按 pool 在档内轮一位，
+    // 档外成员仍按上面的顺序跟在后面。用 key 作锚点，容忍候选增减/重排。
+    const normal = rank.filter((r) => r.group === 0);
+    if (normal.length > 1) {
+      const t0 = normal[0].soon;
+      const band = normal.filter((r) => r.soon - t0 <= BAND_MS);
+      if (band.length > 1) {
+        const p = typeof pool === 'string' ? pool : '';
+        const last = cursors[p];
+        let at = 0;
+        if (typeof last === 'string') {
+          for (let b = 1; b < band.length; b++) {
+            if (band[b].key === last) { at = b; break; }
+          }
+        } else {
+          at = -1; // 首次调用：先按最早到期者，不预轮
+        }
+        const pick = band[(at + 1) % band.length];
+        cursors[p] = pick.key;
+        const head = rank.indexOf(pick);
+        if (head > 0) rank.splice(0, 0, ...rank.splice(head, 1));
+      }
+    }
     const order = [];
     for (let k = 0; k < rank.length; k++) order.push(rank[k].i);
     return order;

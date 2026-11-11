@@ -10,7 +10,9 @@ The strategy prefers candidate seats whose allowance is lost soonest. It combine
 - a compact account-scoped `AUTO_BOOK` injected into the middleware entry file from `/v1/magpie/quotas`;
 - a few provider-specific semantic fixes for counters and unmetered daily allowances.
 
-Candidates are ordered by their exact earliest expiry timestamp. The used percentage only breaks ties between candidates expiring at exactly the same timestamp; rounding expiries into hour buckets is deliberately avoided, since a minute-scale difference can otherwise be inverted by unrelated usage percentages.
+Candidates are ordered by their exact earliest expiry timestamp. The used percentage only breaks ties between candidates expiring at exactly the same timestamp; rounding expiries into hour buckets is deliberately avoided, since a minute-scale difference can otherwise be inverted by unrelated usage percentages. Candidates whose expiry falls within five minutes of the earliest are treated as one band and rotated per group, so minute-scale differences do not pin every turn to the same account. Rotation state lives in the strategy's module scope and is keyed by pool; it resets when the middleware reloads because quota data changed.
+
+The hooks write the ledger only when its content changes, avoiding a periodic timestamp that would otherwise reload the middleware and clear rotation state every 30 minutes.
 
 Quota windows are keyed per account, so two accounts on the same provider cannot mix their expiry data. For CodeArts, only timed credit buckets with remaining balance are treated as expiring allowances; once those are spent, the monthly reset is used instead of the stale aggregate `runsOut` field.
 

@@ -99,9 +99,12 @@ async function sync() {
       const ms = Date.parse(c.at);
       if (!Number.isFinite(ms)) continue;
       const dt = ms - now;
-      if (dt < MIN_MS || dt > MAX_MS) continue;
+      if (dt > MAX_MS) continue;
       const o = c.out === undefined ? undefined : Number(c.out);
       if (o !== undefined && Number.isFinite(o) && o < MIN_RUNSOUT) continue;
+      // 真失效批次(o)豁免 MIN_MS：临近失效时仍要保留，否则会从账本消失。
+      // 重置型短窗仍需过 2h 保护，避免计数器/速率窗抢排序。
+      if (dt < MIN_MS && (o === undefined || !Number.isFinite(o))) continue;
       const row = { r: ms };
       if (o !== undefined && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
       rows.push(row);
@@ -116,8 +119,8 @@ async function sync() {
     book[key] = [...byTime.values()].sort((a, b) => a.r - b.r).slice(0, 12);
   }
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
-  const stamp = new Date(now).toISOString().replace('T', ' ').slice(5, 16);
-  const block = `/*AUTO-BOOK-BEGIN*/\n${lines.join('\n')}\n  // synced ${stamp} UTC by sync-expiry.hooks.js\n/*AUTO-BOOK-END*/`;
+  // 块内不含时间戳：数据不变时 next === content，避免每 30 分钟热重载清零策略状态。
+  const block = `/*AUTO-BOOK-BEGIN*/\n${lines.join('\n')}\n/*AUTO-BOOK-END*/`;
   let content;
   try { content = readFileSync(PLUGIN, 'utf8'); } catch (e) { log(`read plugin failed: ${e.message}`); return; }
   const re = /\/\*AUTO-BOOK-BEGIN\*\/[\s\S]*?\/\*AUTO-BOOK-END\*\//;
