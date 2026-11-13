@@ -1,18 +1,22 @@
 // sync-expiry.hooks.js — 由 magpie 插件宿主管理的配额账本同步守护
-// 每 30 分钟从 /v1/magpie/quotas 拉全量窗口，压成紧凑结构写入
+// 每 5 分钟从 /v1/magpie/quotas 拉全量窗口，压成紧凑结构写入
 // 同目录 nearest-expiry.middleware.js 的 AUTO_BOOK 块（mtime 变化触发热重载）。
 // 数据形状：data[] = {provider, user, windows:[{name, used, remaining,
 //   resetsAt, runsOutAt, runsOut, amount, limit, unit, holdsWhy, display}]}
-// 注入结构：{ 账号键: [ {r: unix ms, o?: runsOut}, ... ] }
+// 注入结构：{ 账号键: [ {r: unix ms, o?: runsOut, d?: 1} | {x: 1}, ... ] }
 //   账号键 = 同一 provider 首次出现用裸 provider，其余用 provider@user，
 //   与 magpie 的 seat key 对应；策略按精确匹配 + 最长前缀回退查表。
 //   r = runsOutAt（真失效批次）优先，否则 resetsAt（到期重置窗）；
 //   o = runsOut（过期量），仅 runsOutAt 带；策略按 MIN_RUNSOUT 过滤小批次。
 //   d = 每日签到限额：供应商给的是 resetsAt，但它当天作废而非重置，
 //       打标记让同步侧豁免 2h 保护、策略侧豁免 skipMs；已烧完的不进账本。
+//   x = 耗尽占位：账号没有任何会作废/会到期的窗口时写入，显式标记它当前
+//       没有临期资格。账本保持命中以屏蔽 seat 里滞后的 soon/lapse，但不提供
+//       排序用的到期时间，账号自然回落到后段。
 // codearts 的赠送/按需积分包把整桶长时效余额配上某个签到子批次的过期时间，
 //   且台账回退会让已耗尽的签到批次一直算有效；只有厂商在 display 里标出
-//   即将过期的积分量时才认这个失效批次，否则退回月度重置窗。
+//   即将过期的积分量时才认这个失效批次，否则记为耗尽（不再退回月度重置窗：
+//   resetsAt 描述的是刷新，不该让只剩长期赠送积分的账号继续占第一档）。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
 // 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
@@ -37,7 +41,7 @@ const DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN = join(DIR, 'nearest-expiry.middleware.js');
 const DATA_DIR = join(homedir(), '.config', 'magpie', 'nearest-expiry');
 const LOG = join(DATA_DIR, 'sync-expiry.log');
-const INTERVAL = 30 * 60 * 1000;
+const INTERVAL = 5 * 60 * 1000;
 const QUOTAS_URL = 'http://127.0.0.1:3425/v1/magpie/quotas';
 const MIN_RUNSOUT = 20;
 const MIN_MS = 2 * 3600 * 1000;
@@ -91,24 +95,24 @@ async function sync() {
       // 台账回退又让已烧完的批次一直算有效，故 runsOutAt 单独出现不可信。
       const hasExpiring = windows.some((w) => w &&
         typeof w.display === 'string' && w.display.indexOf('即将过期') >= 0);
-      const timed = hasExpiring
+      // 没有有效签到限额时不再退回月度重置窗：resetsAt 是刷新时间，让它参与
+      // 排序等于继续消耗只剩长期赠送积分的账号。留空交给下方写耗尽标记 x。
+      candidates = hasExpiring
         ? windows.filter((w) => w &&
             (w.name === '赠送积分包' || w.name === '按需积分包') &&
             w.runsOutAt && Number(w.remaining) > 0)
             .map((w) => ({ at: w.runsOutAt, out: w.runsOut }))
         : [];
-      // 没有有效签到限额时退回月度重置窗，且不带 o（这不是会作废的批次）。
-      if (timed.length) {
-        candidates = timed;
-      } else {
-        const monthly = windows.find((w) => w && w.name === '基础积分包') ||
-                        windows.find((w) => w && w.name === '总积分');
-        candidates = monthly && monthly.resetsAt ? [{ at: monthly.resetsAt }] : [];
-      }
     } else {
       candidates = windows
-        .filter((w) => w && (w.runsOutAt || w.resetsAt) &&
-          !SHORT_WINDOW.test(String(w.name || '')))
+        .filter((w) => {
+          if (!w || !(w.runsOutAt || w.resetsAt)) return false;
+          const name = String(w.name || '');
+          if (SHORT_WINDOW.test(name)) return false;
+          // 每日签到额度烧完后没有可消耗的临期额度，不再进账本占第一档
+          if (!w.runsOutAt && DAILY_WINDOW.test(name) && !(Number(w.remaining) > 0)) return false;
+          return true;
+        })
         .map((w) => ({
           at: w.runsOutAt || w.resetsAt,
           out: w.runsOutAt ? w.runsOut : undefined,
@@ -133,7 +137,9 @@ async function sync() {
       if (c.daily) row.d = 1;
       rows.push(row);
     }
-    if (!rows.length) continue;
+    // 没有会作废/会到期的窗口时显式写耗尽占位：保持账本命中（屏蔽 seat 里
+    // 滞后的 soon/lapse），但不给排序用的到期时间，账号回落到后段。
+    if (!rows.length) { book[key] = [{ x: 1 }]; continue; }
     // 同一时刻的重复批次去重，优先保留信息量更大的记录；r 对齐到 5 分钟、o 取整
     const weight = (r) => (r.d ? 2 : 0) + (r.o !== undefined ? 1 : 0);
     const byTime = new Map();
@@ -146,7 +152,9 @@ async function sync() {
     book[key] = [...byTime.values()].sort((a, b) => a.r - b.r).slice(0, 12);
   }
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
-  // 块内不含时间戳：数据不变时 next === content，避免每 30 分钟热重载清零策略状态。
+  // 空响应守卫：0 个有效账号时不写账本，避免一次刷新失败把已有账本清空。
+  if (!lines.length) { log('no accounts, keep ledger'); return; }
+  // 块内不含时间戳：数据不变时 next === content，避免每次同步都热重载清零策略状态。
   const block = `/*AUTO-BOOK-BEGIN*/\n${lines.join('\n')}\n/*AUTO-BOOK-END*/`;
   let content;
   try { content = readFileSync(PLUGIN, 'utf8'); } catch (e) { log(`read plugin failed: ${e.message}`); return; }

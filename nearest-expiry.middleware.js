@@ -19,11 +19,12 @@ const FIXES = [
   { prefix: 'opencode-go', skipHours: 6 }, // 5h 速率窗不参与排序，按 7d/月窗排（烧=纯赚）
   { prefix: 'marvis', daily: true }, // 每日 10M tokens 的额度，00:00 刷新，数据面无 resetsAt
 ];
-// 全量窗口账本，由 sync-expiry.hooks.js 每 30 分钟从 /v1/magpie/quotas 注入。
+// 全量窗口账本，由 sync-expiry.hooks.js 每 5 分钟从 /v1/magpie/quotas 注入。
 // 结构：{ 账号键: [ {r: runsOutAt|resetsAt 的 unix ms, o: runsOut(可选),
-//   d: 每日签到限额(可选)}, ... ] }
+//   d: 每日签到限额(可选)} | {x: 耗尽占位}, ... ] }
 // 账号键与 seat.key 对齐；命中账本后不再合并 s.soon，避免已耗尽的失效批次
-// 从 seat 的 lapse/soon 里回流，绕过同步侧的修正。
+// 从 seat 的 lapse/soon 里回流，绕过同步侧的修正。只带 x 的耗尽占位同样命中
+// 账本，但不提供到期时间，账号按无到期数据处理、回落到后段。
 const AUTO_BOOK = {
 /*AUTO-BOOK-BEGIN*/
 /*AUTO-BOOK-END*/
