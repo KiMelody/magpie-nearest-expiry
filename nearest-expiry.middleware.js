@@ -9,7 +9,7 @@
 // 返回：seats 的索引排列，只定顺序；候选集、rest、failover 仍由 magpie 核心处理。
 
 const SOON_SKIP = 2 * 3600 * 1000; // 默认忽略 2 小时内到期的窗口（判定为重置型）
-const MIN_RUNSOUT = 20; // 小于此量的过期批次不值得打乱排序
+const MIN_RUNSOUT = 10; // 小于此量的过期批次按已烧完处理，避免尾量被粘性反复消耗
 const BAND_MS = 5 * 60 * 1000; // 到期时间相差 5 分钟内视作同一档，档内轮换
 // 按 pool 记住档内上一次选中的 key；模块常驻，热重载会清零（额度数据变了本就该重排）。
 const cursors = {};

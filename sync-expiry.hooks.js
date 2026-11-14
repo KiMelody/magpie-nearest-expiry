@@ -13,10 +13,10 @@
 //   x = 耗尽占位：账号没有任何会作废/会到期的窗口时写入，显式标记它当前
 //       没有临期资格。账本保持命中以屏蔽 seat 里滞后的 soon/lapse，但不提供
 //       排序用的到期时间，账号自然回落到后段。
-// codearts 的赠送/按需积分包把整桶长时效余额配上某个签到子批次的过期时间，
-//   且台账回退会让已耗尽的签到批次一直算有效；只有厂商在 display 里标出
-//   即将过期的积分量时才认这个失效批次，否则记为耗尽（不再退回月度重置窗：
-//   resetsAt 描述的是刷新，不该让只剩长期赠送积分的账号继续占第一档）。
+// codearts 的限时批次由 runsOutAt/runsOut 表达，批次剩余不足阈值时视为
+//   已经烧完，直接写耗尽占位；不再退回月度 resetting 窗口，也不再依赖
+//   display 文案。阈值留一点余量，避免小额尾量把账号挂在第一档，在
+//   stays=turn 下反复粘住请求、转而消耗长时效赠送额度。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
 // 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
@@ -43,7 +43,7 @@ const DATA_DIR = join(homedir(), '.config', 'magpie', 'nearest-expiry');
 const LOG = join(DATA_DIR, 'sync-expiry.log');
 const INTERVAL = 5 * 60 * 1000;
 const QUOTAS_URL = 'http://127.0.0.1:3425/v1/magpie/quotas';
-const MIN_RUNSOUT = 20;
+const MIN_RUNSOUT = 10;
 const MIN_MS = 2 * 3600 * 1000;
 const MAX_MS = 30 * 86400 * 1000;
 
@@ -90,19 +90,13 @@ async function sync() {
     const windows = p.windows || [];
     let candidates;
     if (p.provider === 'codearts') {
-      // 厂商统计侧的即将过期标记：只有它出现，才说明还有会作废的签到限额。
-      // 赠送积分包的 runsOutAt 描述的是签到子批次，remaining 却是整桶长时效余额，
-      // 台账回退又让已烧完的批次一直算有效，故 runsOutAt 单独出现不可信。
-      const hasExpiring = windows.some((w) => w &&
-        typeof w.display === 'string' && w.display.indexOf('即将过期') >= 0);
-      // 没有有效签到限额时不再退回月度重置窗：resetsAt 是刷新时间，让它参与
-      // 排序等于继续消耗只剩长期赠送积分的账号。留空交给下方写耗尽标记 x。
-      candidates = hasExpiring
-        ? windows.filter((w) => w &&
-            (w.name === '赠送积分包' || w.name === '按需积分包') &&
-            w.runsOutAt && Number(w.remaining) > 0)
-            .map((w) => ({ at: w.runsOutAt, out: w.runsOut }))
-        : [];
+      // 厂商修复后 runsOutAt/runsOut 已是真失效批次，不再读中文 display 文案。
+      // 只认赠送/按需积分包的批次量与余额；尾量不足阈值按耗尽处理，写 x 占位。
+      candidates = windows.filter((w) => w &&
+          (w.name === '赠送积分包' || w.name === '按需积分包') &&
+          w.runsOutAt && Number(w.runsOut) >= MIN_RUNSOUT &&
+          Number(w.remaining) > 0)
+        .map((w) => ({ at: w.runsOutAt, out: w.runsOut }));
     } else {
       candidates = windows
         .filter((w) => {
