@@ -23,7 +23,7 @@
 // r 按 5 分钟对齐、o 取整，进一步容忍供应商读数抖动。
 const ROUND_MS = 5 * 60 * 1000;
 const SHORT_WINDOW = /5\s*(hours|hour|h|小时)/i;
-const DAILY_WINDOW = /每日签到/;
+const DAILY_WINDOW = /每日签到|今日积分/;
 // 导出的 onRequest 是空操作直通，仅用于让宿主识别并常驻本模块 —— 定时器在模块顶层。
 import {
   appendFileSync,
@@ -103,8 +103,9 @@ async function sync() {
           if (!w || !(w.runsOutAt || w.resetsAt)) return false;
           const name = String(w.name || '');
           if (SHORT_WINDOW.test(name)) return false;
-          // 每日签到额度烧完后没有可消耗的临期额度，不再进账本占第一档
-          if (!w.runsOutAt && DAILY_WINDOW.test(name) && !(Number(w.remaining) > 0)) return false;
+          // 烧完（remaining=0）的重置窗没有可消耗的额度，按耗尽处理，写 x 占位；
+          // 每日签到额度烧完后同理，不再占第一档。
+          if (!w.runsOutAt && Number(w.remaining) === 0) return false;
           return true;
         })
         .map((w) => ({
