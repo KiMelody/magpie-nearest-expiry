@@ -3,7 +3,7 @@
 //       候选视作同一档，在档内按组轮换 → 同一时刻才用 used 决胜
 //       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
 //       30 天外的窗口按无到期数据处理，长时效额度不抢第一档；used>=98 但账本
-//       仍有 30 天内会作废的批次时豁免 spent，先把临期额烧完。
+//       仍有 30 天内会作废的批次或 48h 内到期的窗口时豁免 spent，先把临期额烧完。
 // 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
 //   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
 //   真实失效批次（runsOutAt/runsOut）自动升档；计数器型短窗仍靠 FIXES 跳过。
@@ -13,6 +13,7 @@
 const SOON_SKIP = 2 * 3600 * 1000; // 默认忽略 2 小时内到期的窗口（判定为重置型）
 const MIN_RUNSOUT = 10; // 小于此量的过期批次按已烧完处理，避免尾量被粘性反复消耗
 const HORIZON_MS = 30 * 86400 * 1000; // 30 天外的长时效窗口不参与第一档，避免快用完的账号被拉到前面
+const URGENT_MS = 48 * 3600 * 1000; // 48h 内到期的窗口（含 d 签到）与 o 批次一样豁免 spent
 const BAND_MS = 5 * 60 * 1000; // 到期时间相差 5 分钟内视作同一档，档内轮换
 // 按 pool 记住档内上一次选中的 key；模块常驻，热重载会清零（额度数据变了本就该重排）。
 const cursors = {};
@@ -80,14 +81,14 @@ export const strategies = {
       // 账本里的真实失效批次（runsOutAt）、每日签到窗(d)与到期窗口
       // （resetsAt）取最早者。真失效批次与每日签到窗豁免 skipMs：它们是会
       // 作废的额度，不能因为临近就被当成重置窗忽略。
-      let liveBatch = false; // 30 天内仍有余额的真失效批次
+      let liveBatch = false; // 30 天内仍有余额的失效批次或 48h 内到期的窗口
       if (book && book.length && now > 0) {
         for (let w = 0; w < book.length; w++) {
           const e = book[w];
           if (!e || typeof e.r !== 'number' || e.r <= now) continue;
           if (e.r - now > HORIZON_MS) continue; // 长时效窗口：保留但不抢第一档
           if (e.o && e.o < MIN_RUNSOUT) continue;
-          if (e.o) liveBatch = true;
+          if (e.o || e.r - now <= URGENT_MS) liveBatch = true;
           if (!e.o && !e.d && e.r - now < skipMs) continue;
           if (soonMin === 0 || e.r < soonMin) soonMin = e.r;
         }
@@ -100,8 +101,8 @@ export const strategies = {
           if (soonMin === 0 || next < soonMin) soonMin = next;
         } catch (e) { /* moejs 无 Date 构造器则放弃注入 */ }
       }
-      // used>=98 通常意味着整桶快用完；但账本里仍有会作废的批次时，它恰恰
-      // 最该先烧完，不能按 spent 垫底把临期额度留到过期。
+      // used>=98 通常意味着整桶快用完；但账本里仍有 48h 内会作废的额度（o 批次、
+      // d 签到或临期重置窗）时，它恰恰最该先烧完，不能按 spent 垫底把临期额度留到过期。
       const spent = (s.resting === true) ||
         (!liveBatch && s.known === true && typeof s.used === 'number' && s.used >= 98);
       // 排序键：spent 垫底；有到期数据的在前，按精确时刻升序；无数据的排在其后

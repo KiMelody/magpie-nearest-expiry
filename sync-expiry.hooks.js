@@ -20,7 +20,9 @@
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
 // 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
-// r 按 5 分钟对齐、o 取整，进一步容忍供应商读数抖动。
+// r 按 5 分钟对齐、o 取整，进一步容忍供应商读数抖动。写入前再做排序等价
+// 比较：o/d 的数值变化不改变排序（策略只用 r 时刻与存在性）时跳过重写，
+// 轮换游标不再被频繁热重载清零。
 const ROUND_MS = 5 * 60 * 1000;
 const SHORT_WINDOW = /5\s*(hours|hour|h|小时)/i;
 const DAILY_WINDOW = /每日签到|今日积分/;
@@ -157,8 +159,40 @@ async function sync() {
   if (!re.test(content)) { log('AUTO_BOOK block not found'); return; }
   const next = content.replace(re, block);
   if (next === content) { log(`no change (${lines.length} accounts)`); return; }
+  // 排序等价守卫：策略只用 r 时刻与 o/d/x 的存在性排序，o 的数值抖动不改变
+  // 排序结果。等价时跳过重写，避免每次同步都热重载并清零策略里的轮换游标。
+  if (sameOrdering(parseBlock(content), book)) { log(`no change (${lines.length} accounts)`); return; }
   try { atomicWrite(PLUGIN, next); } catch (e) { log(`write failed: ${e.message}`); return; }
   log(`synced: ${lines.length} accounts`);
+}
+
+// 提取排序语义签名：r 时刻精确比较；o/d/x 只看存在性，数值不参与排序。
+function orderingSig(rows) {
+  const parts = [];
+  for (const row of rows) {
+    if (row && row.x !== undefined) { parts.push('x'); continue; }
+    if (!row || typeof row.r !== 'number') { parts.push('?'); continue; }
+    parts.push(`${row.r}:${row.o !== undefined ? 'o' : '-'}${row.d !== undefined ? 'd' : '-'}`);
+  }
+  return parts.join('|');
+}
+
+function parseBlock(text) {
+  const m = text.match(/\/\*AUTO-BOOK-BEGIN\*\/([\s\S]*?)\/\*AUTO-BOOK-END\*\//);
+  if (!m) return null;
+  try { return JSON.parse(`{${m[1].trim().replace(/,$/, '')}` + '}'); } catch { return null; }
+}
+
+function sameOrdering(oldBook, nextBook) {
+  if (!oldBook) return false;
+  const ka = Object.keys(oldBook);
+  const kb = Object.keys(nextBook);
+  if (ka.length !== kb.length) return false;
+  for (const k of kb) {
+    if (!(k in oldBook)) return false;
+    if (orderingSig(oldBook[k]) !== orderingSig(nextBook[k])) return false;
+  }
+  return true;
 }
 
 let busy = false;
