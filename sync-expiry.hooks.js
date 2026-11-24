@@ -17,6 +17,9 @@
 //   已经烧完，直接写耗尽占位；不再退回月度 resetting 窗口，也不再依赖
 //   display 文案。阈值留一点余量，避免小额尾量把账号挂在第一档，在
 //   stays=turn 下反复粘住请求、转而消耗长时效赠送额度。
+// opencode-go 月窗剩余不足 20% 时剔除周窗排序键：周窗是重置型，到点刷新，
+//   但把它作为排序键会把账号顶到第一档、提前烧掉月窗余额；剔除后让位给
+//   真正临期作废的账号。月窗重置后 remaining 回到 100%，规则自动失效。
 // 只保留 2h 之后、30d 之内的窗口；已过期/追不上的丢弃。
 // 相对当前时间计算的短速率窗每次读数都会给出新时间戳，会让账本反复变化、
 // 每次改写源码都热重载并清空策略里的轮换游标，故按窗口名称排除。
@@ -100,11 +103,18 @@ async function sync() {
           Number(w.remaining) > 0)
         .map((w) => ({ at: w.runsOutAt, out: w.runsOut }));
     } else {
+      // opencode-go 的月窗剩余不足 20% 时剔除周窗排序键：周窗是重置型（到点刷新），
+      // 但把账号顶到第一档会提前烧掉月窗余额；此时让位给真正临期作废的账号。
+      // 月窗重置后 remaining 回到 100%，规则自动失效。
+      const monthWindow = p.provider === 'opencode-go' &&
+        windows.find((w) => w && /month/i.test(String(w.name || '')));
+      const skipWeekly = !!monthWindow && Number(monthWindow.remaining) <= 20;
       candidates = windows
         .filter((w) => {
           if (!w || !(w.runsOutAt || w.resetsAt)) return false;
           const name = String(w.name || '');
           if (SHORT_WINDOW.test(name)) return false;
+          if (skipWeekly && /7\s*days/i.test(name)) return false;
           // 烧完（remaining=0）的重置窗没有可消耗的额度，按耗尽处理，写 x 占位；
           // 每日签到额度烧完后同理，不再占第一档。
           if (!w.runsOutAt && Number(w.remaining) === 0) return false;
