@@ -158,6 +158,26 @@ async function sync() {
     }
     book[key] = [...byTime.values()].sort((a, b) => a.r - b.r).slice(0, 12);
   }
+  // opencode-go 随时可用；积分类（带 o 的真失效批次）可能因限额用不完。
+  // 若它的有效排序键（最早窗）当天还有其他积分类账号到期，把它的键压到
+  // 当天末尾，让积分类先用。用最早窗判断，与策略实际排序口径一致。
+  const og = book['opencode-go'];
+  if (og && og.length && og[0] && og[0].r) {
+    const ogDay = new Date(og[0].r).toISOString().slice(0, 10);
+    const creditPeer = Object.keys(book).some((k) => {
+      if (k === 'opencode-go') return false;
+      const rows = book[k];
+      return !!rows && !!rows.length && rows[0].o !== undefined &&
+        new Date(rows[0].r).toISOString().slice(0, 10) === ogDay;
+    });
+    if (creditPeer) {
+      // 所有键整体后移到当天末尾并保序；有效排序键（最早窗）随之落到
+      // 积分类之后，opencode-go 退为当天兜底。
+      const end = Math.floor(Date.parse(`${ogDay}T23:59:59.999Z`) / ROUND_MS) * ROUND_MS;
+      const span = end - og[0].r;
+      og.forEach((row) => { row.r += span; });
+    }
+  }
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
   // 空响应守卫：0 个有效账号时不写账本，避免一次刷新失败把已有账本清空。
   if (!lines.length) { log('no accounts, keep ledger'); return; }
