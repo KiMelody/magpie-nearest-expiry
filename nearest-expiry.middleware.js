@@ -82,6 +82,7 @@ export const strategies = {
       // （resetsAt）取最早者。真失效批次与每日签到窗豁免 skipMs：它们是会
       // 作废的额度，不能因为临近就被当成重置窗忽略。
       let liveBatch = false; // 30 天内仍有余额的失效批次或 48h 内到期的窗口
+      let sortIsCredit = false; // 有效排序键（最早窗）是否带 o：积分类优先用
       if (book && book.length && now > 0) {
         for (let w = 0; w < book.length; w++) {
           const e = book[w];
@@ -90,7 +91,10 @@ export const strategies = {
           if (e.o && e.o < MIN_RUNSOUT) continue;
           if (e.o || e.r - now <= URGENT_MS) liveBatch = true;
           if (!e.o && !e.d && e.r - now < skipMs) continue;
-          if (soonMin === 0 || e.r < soonMin) soonMin = e.r;
+          if (soonMin === 0 || e.r < soonMin) {
+            soonMin = e.r;
+            sortIsCredit = !!e.o; // 最早窗带 o 才算积分类；d 签到/重置窗不算
+          }
         }
       }
       if (fix && fix.daily && now > 0) {
@@ -101,6 +105,15 @@ export const strategies = {
           if (soonMin === 0 || next < soonMin) soonMin = next;
         } catch (e) { /* moejs 无 Date 构造器则放弃注入 */ }
       }
+      // UTC+8 同一天：同日内积分类（最早窗带 o）优先，跨日仍按精确到期排序。
+      // 账号随时可用的重置型窗与限额可能用不完的积分窗撞在同一天时，先烧积分。
+      let day8 = 0;
+      if (soonMin > 0) {
+        try {
+          const d = new Date(soonMin + 8 * 3600 * 1000);
+          day8 = d.getUTCFullYear() * 10000 + (d.getUTCMonth() + 1) * 100 + d.getUTCDate();
+        } catch (e) { day8 = 0; }
+      }
       // used>=98 通常意味着整桶快用完；但账本里仍有 48h 内会作废的额度（o 批次、
       // d 签到或临期重置窗）时，它恰恰最该先烧完，不能按 spent 垫底把临期额度留到过期。
       const spent = (s.resting === true) ||
@@ -108,10 +121,14 @@ export const strategies = {
       // 排序键：spent 垫底；有到期数据的在前，按精确时刻升序；无数据的排在其后
       const group = spent ? 2 : soonMin > 0 ? 0 : 1;
       const key = typeof s.key === 'string' ? s.key : `#${i}`;
-      rank.push({ i: i, group: group, soon: soonMin, used: typeof s.used === 'number' ? s.used : 0, key: key });
+      rank.push({ i: i, group: group, soon: soonMin, day8: day8, credit: sortIsCredit,
+        used: typeof s.used === 'number' ? s.used : 0, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
+      if (a.day8 > 0 && a.day8 === b.day8 && a.credit !== b.credit) {
+        return a.credit ? -1 : 1; // 同一天：积分类先用
+      }
       if (a.soon !== b.soon) return a.soon - b.soon; // 精确到期时刻升序
       if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同一时刻：快用完的先烧
       return a.i - b.i;
@@ -122,7 +139,7 @@ export const strategies = {
     const normal = rank.filter((r) => r.group === 0);
     if (normal.length > 1) {
       const t0 = normal[0].soon;
-      const band = normal.filter((r) => r.soon - t0 <= BAND_MS);
+      const band = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS);
       if (band.length > 1) {
         const p = typeof pool === 'string' ? pool : '';
         const last = cursors[p];
