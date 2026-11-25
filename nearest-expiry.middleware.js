@@ -4,6 +4,8 @@
 //       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
 //       30 天外的窗口按无到期数据处理，长时效额度不抢第一档；used>=98 但账本
 //       仍有 30 天内会作废的批次或 48h 内到期的窗口时豁免 spent，先把临期额烧完。
+// options.timeRules 可按供应商前缀在指定时段降权（软降权，排到同组末尾仍可兜底）；
+//       有效排序键按 UTC+8 自然日算 4 天内到期的账号豁免降权，保持正常使用。
 // 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
 //   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
 //   真实失效批次（runsOutAt/runsOut）自动升档；计数器型短窗仍靠 FIXES 跳过。
@@ -15,6 +17,46 @@ const MIN_RUNSOUT = 10; // 小于此量的过期批次按已烧完处理，避�
 const HORIZON_MS = 30 * 86400 * 1000; // 30 天外的长时效窗口不参与第一档，避免快用完的账号被拉到前面
 const URGENT_MS = 48 * 3600 * 1000; // 48h 内到期的窗口（含 d 签到）与 o 批次一样豁免 spent
 const BAND_MS = 5 * 60 * 1000; // 到期时间相差 5 分钟内视作同一档，档内轮换
+const TZ8_MS = 8 * 3600 * 1000; // UTC+8 偏移
+// 前缀边界匹配：workbuddy 不能误伤 workbuddy-ai；key 为前缀本身或前缀后跟 @/: 才算命中
+function prefixHit(key, prefix) {
+  if (typeof key !== 'string' || typeof prefix !== 'string' || !prefix) return false;
+  if (key === prefix) return true;
+  return key.indexOf(prefix) === 0 && (key[prefix.length] === '@' || key[prefix.length] === '/');
+}
+// 解析 HH:MM 为当天的分钟数
+function hhmm(s) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s || ''));
+  if (!m) return -1;
+  const h = Number(m[1]); const mi = Number(m[2]);
+  return (h >= 0 && h < 24 && mi >= 0 && mi < 60) ? h * 60 + mi : -1;
+}
+// 当前是否落在规则配置的降权时段（UTC+8，左闭右开）
+function inWindow(local, rule) {
+  const days = rule.days;
+  if (Array.isArray(days) && days.length && days.indexOf(local.day) < 0) return false;
+  const wins = rule.windows;
+  if (!Array.isArray(wins) || !wins.length) return false;
+  for (let i = 0; i < wins.length; i++) {
+    const w = wins[i];
+    if (!Array.isArray(w) || w.length < 2) continue;
+    const from = hhmm(w[0]); const to = hhmm(w[1]);
+    if (from < 0 || to < 0) continue;
+    if (local.min >= from && local.min < to) return true;
+  }
+  return false;
+}
+// UTC+8 自然日的天数差（target - today），只按日期取整，不看时刻
+function dayDiff8(now, targetMs) {
+  if (!(now > 0) || !(targetMs > 0)) return 9999;
+  try {
+    const today = new Date(now + TZ8_MS);
+    const tgt = new Date(targetMs + TZ8_MS);
+    const y0 = Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate());
+    const y1 = Date.UTC(tgt.getUTCFullYear(), tgt.getUTCMonth(), tgt.getUTCDate());
+    return Math.round((y1 - y0) / 86400000);
+  } catch (e) { return 9999; }
+}
 // 按 pool 记住档内上一次选中的 key；模块常驻，热重载会清零（额度数据变了本就该重排）。
 const cursors = {};
 const FIXES = [
@@ -38,6 +80,19 @@ export const strategies = {
   'nearest-expiry': (pool, seats, options) => {
     let now = 0;
     try { now = Date.now(); } catch (e) { now = 0; }
+    // 时段降权的配置与当前 UTC+8 时间
+    const cfg = options && typeof options === 'object' ? options : {};
+    const timeRules = Array.isArray(cfg.timeRules) ? cfg.timeRules : [];
+    const deferDueDays = typeof cfg.deferDueDays === 'number' ? cfg.deferDueDays : 4;
+    let localDay = -1; let localMin = -1;
+    if (now > 0) {
+      try {
+        const d = new Date(now + TZ8_MS);
+        localDay = d.getUTCDay();
+        localMin = d.getUTCHours() * 60 + d.getUTCMinutes();
+      } catch (e) { localDay = -1; localMin = -1; }
+    }
+    const local = { day: localDay, min: localMin };
     const bookKeys = Object.keys(AUTO_BOOK);
     const rank = [];
     for (let i = 0; i < seats.length; i++) {
@@ -121,11 +176,25 @@ export const strategies = {
       // 排序键：spent 垫底；有到期数据的在前，按精确时刻升序；无数据的排在其后
       const group = spent ? 2 : soonMin > 0 ? 0 : 1;
       const key = typeof s.key === 'string' ? s.key : `#${i}`;
+      // 时段降权：命中规则的供应商在降权时段内排到同组末尾；
+      // 有效排序键按 UTC+8 自然日算 deferDueDays 天内到期时豁免（临期照常用）。
+      let defer = false;
+      if (timeRules.length && local.day >= 0 && group === 0) {
+        const dueIn = dayDiff8(now, soonMin);
+        const nearDue = dueIn <= deferDueDays;
+        if (!nearDue) {
+          for (let r = 0; r < timeRules.length; r++) {
+            const rule = timeRules[r];
+            if (prefixHit(key, rule.prefix) && inWindow(local, rule)) { defer = true; break; }
+          }
+        }
+      }
       rank.push({ i: i, group: group, soon: soonMin, day8: day8, credit: sortIsCredit,
-        used: typeof s.used === 'number' ? s.used : 0, key: key });
+        defer: defer, used: typeof s.used === 'number' ? s.used : 0, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
+      if (a.defer !== b.defer) return a.defer ? 1 : -1; // 时段降权：非降权者优先
       if (a.day8 > 0 && a.day8 === b.day8 && a.credit !== b.credit) {
         return a.credit ? -1 : 1; // 同一天：积分类先用
       }
@@ -136,7 +205,8 @@ export const strategies = {
 
     // 正常候选里，最早到期后 BAND_MS 内的视作同一档；按 pool 在档内轮一位，
     // 档外成员仍按上面的顺序跟在后面。用 key 作锚点，容忍候选增减/重排。
-    const normal = rank.filter((r) => r.group === 0);
+    // 档内只在最前面那一档（defer 相同）里轮换：降权者不与未降权者同档轮换。
+    const normal = rank.filter((r) => r.group === 0 && !r.defer);
     if (normal.length > 1) {
       const t0 = normal[0].soon;
       const band = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS);

@@ -1,6 +1,6 @@
 {
   "name": "middleware-nearest-expiry",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "description": "A magpie routing strategy that burns the allowance expiring soonest first, with a hooks-based quota-book sync.",
   "license": "MIT",
   "files": [
@@ -15,6 +15,12 @@
     "summary": "Route to the allowance that expires first",
     "middleware": "./nearest-expiry.middleware.js",
     "hooks": "./sync-expiry.hooks.js",
-    "options": {}
+    "options": {
+      "timeRules": [
+        { "prefix": "workbuddy", "days": [0,1,2,3,4,5,6], "windows": [["08:30","22:00"]] },
+        { "prefix": "opencode-go", "days": [1,2,3,4,5], "windows": [["08:30","12:00"],["14:00","20:00"]] }
+      ],
+      "deferDueDays": 4
+    }
   }
 }
