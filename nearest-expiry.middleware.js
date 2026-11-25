@@ -1,11 +1,15 @@
 // magpie 路由策略：nearest-expiry —— 会作废的额度最先烧。
-// 排序：正常成员按有效窗口 min(soon) 的精确时间戳升序 → 最早到期后 BAND_MS 内的
-//       候选视作同一档，在档内按组轮换 → 同一时刻才用 used 决胜
+// 同刻时优先有峰谷价的供应商（低谷期省成本）；高峰降权把这类供应商推后。
+// peakPricing 取 magpie 官方 4 类 + 单独维护的 workbuddy，可用 options 覆盖。
+// 精确到期时刻升序 → 同一时刻：有峰谷价者优先 → 再按 used 决胜
 //       → 无到期数据的（无期限额度）垫后 → resting/已用尽（used>=98）垫底。
 //       30 天外的窗口按无到期数据处理，长时效额度不抢第一档；used>=98 但账本
 //       仍有 30 天内会作废的批次或 48h 内到期的窗口时豁免 spent，先把临期额烧完。
 // options.timeRules 可按供应商前缀在指定时段降权（软降权，排到同组末尾仍可兜底）；
 //       有效排序键按 UTC+8 自然日算 4 天内到期的账号豁免降权，保持正常使用。
+//       默认 workbuddy 每天 08:30-22:00，opencode-go 工作日 09:00-12:00、14:00-18:00。
+// options.peakPricing 列出有峰谷价的供应商（默认官方 4 类 + workbuddy）；同刻到期时
+//       这类供应商优先，用于低谷期多用按峰谷计费的额度，不越过更早到期的账号。
 // 数据面：seatJSON 只有 9 个字段（soon 只说何时重置、不说烧它消耗什么），
 //   故由 sync-expiry.hooks.js 定时把 /v1/magpie/quotas 的全量窗口账本注入 AUTO_BOOK：
 //   真实失效批次（runsOutAt/runsOut）自动升档；计数器型短窗仍靠 FIXES 跳过。
@@ -84,6 +88,9 @@ export const strategies = {
     const cfg = options && typeof options === 'object' ? options : {};
     const timeRules = Array.isArray(cfg.timeRules) ? cfg.timeRules : [];
     const deferDueDays = typeof cfg.deferDueDays === 'number' ? cfg.deferDueDays : 4;
+    // 峰谷价供应商清单：无 options 时用 magpie 官方 4 类 + 单独维护的 workbuddy
+    const peakList = Array.isArray(cfg.peakPricing) ? cfg.peakPricing :
+      ['deepseek', 'commandcode', 'opencode-go', 'ollama-cloud', 'workbuddy'];
     let localDay = -1; let localMin = -1;
     if (now > 0) {
       try {
@@ -189,8 +196,12 @@ export const strategies = {
           }
         }
       }
+      let peak = false;
+      for (let p = 0; p < peakList.length; p++) {
+        if (prefixHit(key, peakList[p])) { peak = true; break; }
+      }
       rank.push({ i: i, group: group, soon: soonMin, day8: day8, credit: sortIsCredit,
-        defer: defer, used: typeof s.used === 'number' ? s.used : 0, key: key });
+        defer: defer, peak: peak, used: typeof s.used === 'number' ? s.used : 0, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
@@ -199,32 +210,34 @@ export const strategies = {
         return a.credit ? -1 : 1; // 同一天：积分类先用
       }
       if (a.soon !== b.soon) return a.soon - b.soon; // 精确到期时刻升序
-      if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同一时刻：快用完的先烧
+      if (a.soon > 0 && a.peak !== b.peak) return a.peak ? -1 : 1; // 同刻：有峰谷价者优先（低谷省钱）
+      if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同刻：快用完的先烧
       return a.i - b.i;
     });
 
-    // 正常候选里，最早到期后 BAND_MS 内的视作同一档；按 pool 在档内轮一位，
-    // 档外成员仍按上面的顺序跟在后面。用 key 作锚点，容忍候选增减/重排。
-    // 档内只在最前面那一档（defer 相同）里轮换：降权者不与未降权者同档轮换。
+    // 正常候选里，最早到期后 BAND_MS 内的视作同一档，档内轮换一位，避免分钟级
+    // 差异把每轮对话钉在同一账号。轮换池只取 BAND 内、与头部同峰谷属性的子组：
+    // 同刻的 peak 账号排前（排序已保证），nonpeak 不会被轮换顶到它前面。
+    // 用 key 作锚点并区分峰谷属性，容忍候选增减，也避免两组轮换状态互相干扰。
     const normal = rank.filter((r) => r.group === 0 && !r.defer);
     if (normal.length > 1) {
       const t0 = normal[0].soon;
-      const band = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS);
-      if (band.length > 1) {
-        const p = typeof pool === 'string' ? pool : '';
+      const headPeak = normal[0].peak;
+      const rot = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS && r.peak === headPeak);
+      if (rot.length > 1) {
+        const p = `${typeof pool === 'string' ? pool : ''}|${headPeak ? 'p' : 'n'}`;
         const last = cursors[p];
-        let at = 0;
+        let at = -1;
         if (typeof last === 'string') {
-          for (let b = 1; b < band.length; b++) {
-            if (band[b].key === last) { at = b; break; }
+          for (let b = 0; b < rot.length; b++) {
+            if (rot[b].key === last) { at = b; break; }
           }
-        } else {
-          at = -1; // 首次调用：先按最早到期者，不预轮
         }
-        const pick = band[(at + 1) % band.length];
+        const pick = rot[(at + 1) % rot.length];
         cursors[p] = pick.key;
         const head = rank.indexOf(pick);
-        if (head > 0) rank.splice(0, 0, ...rank.splice(head, 1));
+        const base = rank.indexOf(rot[0]);
+        if (head > base) rank.splice(base, 0, ...rank.splice(head, 1));
       }
     }
     const order = [];
