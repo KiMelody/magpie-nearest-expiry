@@ -170,6 +170,7 @@ export const strategies = {
       // 作废的额度，不能因为临近就被当成重置窗忽略。
       let liveBatch = false; // 30 天内仍有余额的失效批次或 48h 内到期的窗口
       let sortIsCredit = false; // 有效排序键（最早窗）是否带 o：积分类优先用
+      let sortIsWeak = false; // 有效排序键是否带 w：opencode-go 7d 同刻让位其他供应商
       if (book && book.length && now > 0) {
         for (let w = 0; w < book.length; w++) {
           const e = book[w];
@@ -181,6 +182,7 @@ export const strategies = {
           if (soonMin === 0 || e.r < soonMin) {
             soonMin = e.r;
             sortIsCredit = !!e.o; // 最早窗带 o 才算积分类；d 签到/重置窗不算
+            sortIsWeak = !!e.w;
           }
         }
       }
@@ -226,7 +228,7 @@ export const strategies = {
         if (prefixHit(key, peakList[p])) { peak = true; break; }
       }
       rank.push({ i: i, group: group, soon: soonMin, day8: day8, credit: sortIsCredit,
-        defer: defer, peak: peak, used: typeof s.used === 'number' ? s.used : 0, key: key });
+        weak: sortIsWeak, defer: defer, peak: peak, used: typeof s.used === 'number' ? s.used : 0, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
@@ -235,6 +237,7 @@ export const strategies = {
         return a.credit ? -1 : 1; // 同一天：积分类先用
       }
       if (a.soon !== b.soon) return a.soon - b.soon; // 精确到期时刻升序
+      if (a.soon > 0 && a.weak !== b.weak) return a.weak ? 1 : -1; // 同刻：7d 弱窗让位其他供应商
       if (a.soon > 0 && a.peak !== b.peak) return a.peak ? -1 : 1; // 同刻：有峰谷价者优先（低谷省钱）
       if (a.soon > 0 && a.used !== b.used) return b.used - a.used; // 同刻：快用完的先烧
       return a.i - b.i;

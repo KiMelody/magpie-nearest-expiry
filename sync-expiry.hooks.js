@@ -128,13 +128,28 @@ async function sync() {
     const windows = p.windows || [];
     let candidates;
     if (p.provider === 'codearts') {
-      // 厂商修复后 runsOutAt/runsOut 已是真失效批次，不再读中文 display 文案。
-      // 只认赠送/按需积分包的批次量与余额；尾量不足阈值按耗尽处理，写 x 占位。
-      candidates = windows.filter((w) => w &&
-          (w.name === '赠送积分包' || w.name === '按需积分包') &&
-          w.runsOutAt && Number(w.runsOut) >= MIN_RUNSOUT &&
-          Number(w.remaining) > 0)
-        .map((w) => ({ at: w.runsOutAt, out: w.runsOut }));
+      // 0.3.25 起厂商把 runsOutAt/runsOut 挪到「总积分」上，分项桶只作 aside。
+      // 月度「总积分/基础积分包」当月用完即作废（用户确认），按作废余额处理：
+      // 用 resetsAt 作到期键、remaining 当作废量(o)，让它进第一档优先烧。
+      // 同时保留对 runsOutAt 真批次的识别（若插件版本又变化）。
+      const monthly = windows.filter((w) => w &&
+          (w.name === '总积分' || w.name === '基础积分包') &&
+          w.resetsAt && Number(w.remaining) > 0);
+      const batches = windows.filter((w) => w &&
+          (w.name === '赠送积分包' || w.name === '按需积分包' || w.name === '总积分') &&
+          w.runsOutAt && Number(w.runsOut) >= MIN_RUNSOUT && Number(w.remaining) > 0);
+      const merged = [
+        ...batches.map((w) => ({ at: w.runsOutAt, out: w.runsOut })),
+        ...monthly.map((w) => ({ at: w.resetsAt, out: w.remaining })),
+      ];
+      // 同一到期时刻去重（总积分可能同时带 runsOutAt 与 resetsAt），
+      // 优先保留带作废量 out 的那条。
+      candidates = [];
+      for (const c of merged) {
+        const dup = candidates.findIndex((x) => x.at === c.at);
+        if (dup < 0) { candidates.push(c); continue; }
+        if (c.out !== undefined && candidates[dup].out === undefined) candidates[dup] = c;
+      }
     } else {
       // opencode-go 的月窗剩余不足 20% 时剔除周窗排序键：周窗是重置型（到点刷新），
       // 但把账号顶到第一档会提前烧掉月窗余额；此时让位给真正临期作废的账号。
@@ -153,13 +168,21 @@ async function sync() {
           if (!w.runsOutAt && Number(w.remaining) === 0) return false;
           return true;
         })
-        .map((w) => ({
-          at: w.runsOutAt || w.resetsAt,
-          out: w.runsOutAt ? w.runsOut : undefined,
-          // 每日签到限额给的是 resetsAt，语义上却是当天作废；仅对仍有余额的
-          // 重置型窗口打标记，让下游按会作废处理，不与真失效批次混拼。
-          daily: !w.runsOutAt && DAILY_WINDOW.test(String(w.name || '')) && Number(w.remaining) > 0,
-        }));
+        .map((w) => {
+          const name = String(w.name || '');
+          // opencode-go Month 当月作废（用户确认），用 remaining 当作废量(o)，
+          // 让它进第一档优先烧；7 days 标记为 weak，同刻到期时排其他供应商后。
+          const isMonth = p.provider === 'opencode-go' && /^month$/i.test(name);
+          const is7d = p.provider === 'opencode-go' && /7\s*days/i.test(name);
+          return {
+            at: w.runsOutAt || w.resetsAt,
+            out: w.runsOutAt ? w.runsOut : (isMonth ? w.remaining : undefined),
+            weak: is7d ? 1 : undefined,
+            // 每日签到限额给的是 resetsAt，语义上却是当天作废；仅对仍有余额的
+            // 重置型窗口打标记，让下游按会作废处理，不与真失效批次混拼。
+            daily: !w.runsOutAt && DAILY_WINDOW.test(name) && Number(w.remaining) > 0,
+          };
+        });
     }
     const rows = [];
     for (const c of candidates) {
@@ -175,6 +198,7 @@ async function sync() {
       const row = { r: ms };
       if (o !== undefined && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
       if (c.daily) row.d = 1;
+      if (c.weak) row.w = 1;
       rows.push(row);
     }
     // 没有会作废/会到期的窗口时显式写耗尽占位：保持账本命中（屏蔽 seat 里
