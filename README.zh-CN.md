@@ -32,6 +32,12 @@ hooks 只在账本内容变化时写文件，不再写入周期性时间戳，�
 
 hooks 入口在 magpie 插件宿主内运行一个 5 分钟定时器。它不向模型暴露工具，也不改请求体，只刷新 middleware 入口文件里的账本块，由 magpie 热重载策略。
 
+## 耗尽账号在同一长回合内跳过（onAccount）
+
+`stays=turn` 的粘性会在每个请求里把上次答复的账号强制提到首位，策略排到末尾也拦不住同一长回合内的继续消耗。插件导出 `onAccount(account, ctx)`：hooks 每 5 分钟把限时额度已烧完（账本 `x` 占位）账号的匿名 ref 写入 `AUTO_SKIP` 块，`onAccount` 命中即返回 `{skip:true}`，magpie 直接试下一个候选；答复成功后粘性改写到新账号，同一长回合从下一次请求起就不再回到耗尽账号。
+
+跳过的账号来自 magpie 配置的 `nearest-expiry/nearest-expiry` 组，其他策略的组不受影响。只有当耗尽账号所在的全部组都没有其他可用账号时，才不跳过它（整组兜底），避免所有候选被跳过导致请求失败。ref 是 magpie 对账号的匿名标识，hooks 用与 magpie 源码一致的 HMAC-SHA256 从 `account-ref.key`、`user`、`plan` 算出；key 尚未生成时名单为空，等首次 onAccount 触发 magpie 创建 key 后的下一轮同步再生效。首次核对可临时把 options 的 `debugRefs` 设为 true，日志会打印各账号的 `(provider, ref)`。
+
 ## 安装
 
 ```bash

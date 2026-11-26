@@ -32,6 +32,12 @@ An account with no losing or resetting window gets an `x` exhaustion placeholder
 
 The hooks entry runs a lightweight 5-minute timer inside magpie's plugin host. It has no model-facing tools and does not change request bodies; it only refreshes the middleware source block so magpie hot-reloads the strategy.
 
+## Skipping exhausted accounts inside a long turn
+
+With `stays=turn`, magpie promotes the last responder to the front of the candidate list on every request, so ranking an account last cannot stop a long turn from returning to it. The plugin exports `onAccount(account, ctx)`: every five minutes the hooks write the anonymous refs of accounts whose timed allowance is spent (the ledger's `x` placeholder) into an `AUTO_SKIP` block, and `onAccount` returns `{skip:true}` on a hit. magpie then tries the next candidate; once it succeeds, the turn's stickiness moves to the new account, so later requests in the same turn no longer return to the exhausted one.
+
+Only accounts in groups routed by `nearest-expiry/nearest-expiry` are skipped; other strategies are untouched. An exhausted account is kept when every group it belongs to has no other usable account, so skipping cannot leave a request with no candidate. The ref is magpie's anonymous account identifier; the hooks derive it with the same HMAC-SHA256 as magpie's source, from `account-ref.key`, `user` and `plan`. Before the key exists the skip list is empty and fills in on the next sync after the first `onAccount` creates it. To check the mapping once, set the `debugRefs` option to true and the log prints each account's `(provider, ref)`.
+
 ## Install
 
 ```bash

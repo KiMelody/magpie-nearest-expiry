@@ -30,6 +30,7 @@ const ROUND_MS = 5 * 60 * 1000;
 const SHORT_WINDOW = /5\s*(hours|hour|h|小时)/i;
 const DAILY_WINDOW = /每日签到|今日积分/;
 // 导出的 onRequest 是空操作直通，仅用于让宿主识别并常驻本模块 —— 定时器在模块顶层。
+import { createHmac } from 'node:crypto';
 import {
   appendFileSync,
   existsSync,
@@ -44,10 +45,33 @@ import { fileURLToPath } from 'node:url';
 
 const DIR = dirname(fileURLToPath(import.meta.url));
 const PLUGIN = join(DIR, 'nearest-expiry.middleware.js');
-const DATA_DIR = join(homedir(), '.config', 'magpie', 'nearest-expiry');
+const MAGPIE_DIR = join(homedir(), '.config', 'magpie');
+const DATA_DIR = join(MAGPIE_DIR, 'nearest-expiry');
 const LOG = join(DATA_DIR, 'sync-expiry.log');
 const INTERVAL = 5 * 60 * 1000;
 const QUOTAS_URL = 'http://127.0.0.1:3425/v1/magpie/quotas';
+const REF_KEY_PATH = join(MAGPIE_DIR, 'account-ref.key');
+const PROVIDERS_PATH = join(MAGPIE_DIR, 'providers.json');
+const ROUTING_ID = 'nearest-expiry/nearest-expiry';
+// 与 magpie 源码 internal/middleware/account.go 的 accountRef 完全一致：
+// HMAC-SHA256(key, "magpie account ref v1\0" + name + "\0" + agent + "\0"
+//   + lower(user) + "\0" + lower(plan) + "\0")[:16] 的 hex。
+// name = plugin.Name(spec)，git spec 且配置根无 package.json 时为 spec 原样；
+// agent = 插件账号固定 "plugin"；user/plan 取自 quotas。
+const REF_AGENT = 'plugin';
+// plugin.Name(spec)：git spec 且配置根无 package.json 时为 spec 原样。
+// 从 plugins.json 读出本插件的 spec，避免把仓库路径写死在源码里。
+function pluginSpec() {
+  try {
+    const d = JSON.parse(readFileSync(join(MAGPIE_DIR, 'plugins.json'), 'utf8'));
+    const list = Array.isArray(d.plugins) ? d.plugins : [];
+    for (const p of list) {
+      if (typeof p.spec === 'string' && p.spec.indexOf('magpie-nearest-expiry') >= 0) return p.spec;
+    }
+  } catch {}
+  return '';
+}
+function refName() { return pluginSpec(); }
 const MIN_RUNSOUT = 10;
 const MIN_MS = 2 * 3600 * 1000;
 const MAX_MS = 30 * 86400 * 1000;
@@ -161,22 +185,117 @@ async function sync() {
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
   // 空响应守卫：0 个有效账号时不写账本，避免一次刷新失败把已有账本清空。
   if (!lines.length) { log('no accounts, keep ledger'); return; }
+  // 生成跳过名单：只含 nearest-expiry 组里、限时额度已烧完（账本 x 占位）的账号。
+  // 整组耗尽时清空，避免所有候选被 skip 导致请求失败。
+  const skipRefs = buildSkipRefs(data.data, book);
+  const skipBlock = `/*AUTO-SKIP-BEGIN*/\n  "refs": ${JSON.stringify(skipRefs)}\n/*AUTO-SKIP-END*/`;
   // 块内不含时间戳：数据不变时 next === content，避免每次同步都热重载清零策略状态。
   const block = `/*AUTO-BOOK-BEGIN*/\n${lines.join('\n')}\n/*AUTO-BOOK-END*/`;
   let content;
   try { content = readFileSync(PLUGIN, 'utf8'); } catch (e) { log(`read plugin failed: ${e.message}`); return; }
   const re = /\/\*AUTO-BOOK-BEGIN\*\/[\s\S]*?\/\*AUTO-BOOK-END\*\//;
-  if (!re.test(content)) { log('AUTO_BOOK block not found'); return; }
-  const next = content.replace(re, block);
-  if (next === content) { log(`no change (${lines.length} accounts)`); return; }
-  // 排序等价守卫：策略只用 r 时刻与 o/d/x 的存在性排序，o 的数值抖动不改变
-  // 排序结果。等价时跳过重写，避免每次同步都热重载并清零策略里的轮换游标。
-  if (sameOrdering(parseBlock(content), book)) { log(`no change (${lines.length} accounts)`); return; }
+  const skipRe = /\/\*AUTO-SKIP-BEGIN\*\/[\s\S]*?\/\*AUTO-SKIP-END\*\//;
+  if (!re.test(content) || !skipRe.test(content)) { log('AUTO blocks not found'); return; }
+  const bookSame = sameOrdering(parseBlock(content), book);
+  const skipSame = parseSkip(content) === JSON.stringify(skipRefs);
+  if (bookSame && skipSame) { log(`no change (${lines.length} accounts)`); return; }
+  // 只有其中一个块变化时也写：整体替换 content，两个块都用新内容。
+  let next = content;
+  if (!bookSame) next = next.replace(re, block);
+  if (!skipSame) next = next.replace(skipRe, skipBlock);
   try { atomicWrite(PLUGIN, next); } catch (e) { log(`write failed: ${e.message}`); return; }
-  log(`synced: ${lines.length} accounts`);
+  log(`synced: ${lines.length} accounts, skip=${skipRefs.length}`);
 }
 
 // 提取排序语义签名：r 时刻精确比较；o/d/x 只看存在性，数值不参与排序。
+// magpie 的账号匿名 ref：与 internal/middleware/account.go 的 accountRef 一致。
+// 读不到 key 时返回 null（首次 onAccount 触发前 key 尚未生成，下一轮再算）。
+function readRefKey() {
+  try {
+    const hex = readFileSync(REF_KEY_PATH, 'utf8').trim();
+    const buf = Buffer.from(hex, 'hex');
+    return buf.length === 32 ? buf : null;
+  } catch { return null; }
+}
+function accountRef(key, user, plan) {
+  const mac = createHmac('sha256', key);
+  for (const s of ['magpie account ref v1', refName(), REF_AGENT, String(user).toLowerCase(), String(plan || '').toLowerCase()]) {
+    mac.update(Buffer.from(s, 'utf8'));
+    mac.update(Buffer.from([0]));
+  }
+  return mac.digest('hex').slice(0, 32);
+}
+
+// nearest-expiry 组列表：每组含成员 provider 集合。member 形如
+// "officeace/deepseek-v4.1-flash"，取 provider id 部分。
+function nearestGroups() {
+  const groups = [];
+  try {
+    const d = JSON.parse(readFileSync(PROVIDERS_PATH, 'utf8'));
+    for (const g of (Array.isArray(d.groups) ? d.groups : [])) {
+      if (g.routing !== ROUTING_ID) continue;
+      const providers = new Set();
+      for (const m of (Array.isArray(g.members) ? g.members : [])) {
+        if (typeof m === 'string' && m.indexOf('/') > 0) providers.add(m.slice(0, m.indexOf('/')));
+      }
+      if (providers.size) groups.push(providers);
+    }
+  } catch {}
+  return groups;
+}
+
+// 解析现有 skip 块，供等价判断使用
+function parseSkip(text) {
+  const m = text.match(/\/\*AUTO-SKIP-BEGIN\*\/([\s\S]*?)\/\*AUTO-SKIP-END\*\//);
+  if (!m) return null;
+  try { return JSON.stringify(JSON.parse(`{${m[1].trim().replace(/,$/, '')}}`).refs || []); } catch { return null; }
+}
+
+// 生成要跳过的账号 ref。dataRows 是 /v1/magpie/quotas 的 data[]，book 是本次账本。
+// 只处理账本写 x（限时额度烧完）且属于 nearest-expiry 组的账号。
+function buildSkipRefs(dataRows, book) {
+  const key = readRefKey();
+  if (!key) { log('ref key not ready, skip list empty'); return []; }
+  const groups = nearestGroups();
+  if (!groups.length) return [];
+  const nearestSet = new Set();
+  for (const g of groups) for (const p of g) nearestSet.add(p);
+  // 收集每个 provider 的账号：user -> plan
+  const accounts = [];
+  for (const row of (Array.isArray(dataRows) ? dataRows : [])) {
+    const p = String(row.provider || '');
+    if (!nearestSet.has(p)) continue;
+    accounts.push({ provider: p, user: row.user, plan: row.plan });
+  }
+  // 账本键对应规则与 sync 写账本时一致：同 provider 第一个账号用裸 id，
+  // 其余用 provider@user。裸键只属于第一个账号，不能套到所有账号上。
+  const firstSeen = new Set();
+  const accountKeys = [];
+  for (const a of accounts) {
+    const first = !firstSeen.has(a.provider);
+    firstSeen.add(a.provider);
+    accountKeys.push({ a, keys: first || !a.user ? [a.provider] : [`${a.provider}@${a.user}`] });
+  }
+  const exhaustedKeys = new Set();
+  for (const k of Object.keys(book)) {
+    const rows = book[k];
+    if (Array.isArray(rows) && rows.length === 1 && rows[0] && rows[0].x === 1) exhaustedKeys.add(k);
+  }
+  const isExhausted = (ak) => ak.keys.some((k) => exhaustedKeys.has(k));
+  const kept = [];
+  for (const ak of accountKeys) {
+    if (!isExhausted(ak)) continue;
+    // 该账号所在的组里若还有别的非耗尽账号，就正常 skip。
+    // 只有当它所在的每一个组都全耗尽（组里所有 provider 的所有账号都耗尽），
+    // 才不 skip 它，避免整组无候选时请求失败。
+    const inGroups = groups.filter((g) => g.has(ak.a.provider));
+    const hasAlternative = inGroups.some((g) => accountKeys.some((other) =>
+      other !== ak && g.has(other.a.provider) && !isExhausted(other)));
+    if (hasAlternative || inGroups.length === 0) kept.push(accountRef(key, ak.a.user, ak.a.plan));
+  }
+  return [...new Set(kept)];
+}
+
 function orderingSig(rows) {
   const parts = [];
   for (const row of rows) {

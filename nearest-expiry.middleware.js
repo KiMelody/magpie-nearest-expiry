@@ -79,6 +79,31 @@ const AUTO_BOOK = {
 /*AUTO-BOOK-BEGIN*/
 /*AUTO-BOOK-END*/
 };
+// 已耗尽账号的 ref 列表，由 sync-expiry.hooks.js 每 5 分钟写入。
+// 只含 nearest-expiry 组里、限时额度烧完的账号；整组耗尽时 hooks 会清空，
+// 避免所有候选被 skip 导致请求失败。onAccount 命中即 {skip:true}，让 magpie
+// 在同一长回合内也绕过该账号（turn 粘性会把策略排末尾的账号强制提到首位）。
+const AUTO_SKIP = {
+/*AUTO-SKIP-BEGIN*/
+  "refs": []
+/*AUTO-SKIP-END*/
+};
+
+// 每次实际下发订阅账号前检查：耗尽账号直接跳过，试下一个候选。
+// 返回 undefined 表示正常用该账号；返回 null 算失败（fail open），不跳过。
+export function onAccount(account, ctx) {
+  // 调试开关：options.debugRefs=true 时打印 (provider, ref)，用于首次核对
+  // hooks 算出的 ref 与 magpie 实际值是否一致；核对后关闭。
+  if (ctx && ctx.options && ctx.options.debugRefs && account && typeof account.ref === 'string' && console && typeof console.log === 'function') {
+    console.log(`[nearest-expiry] account ${account.provider}/${account.kind} ref=${account.ref}`);
+  }
+  const refs = AUTO_SKIP.refs;
+  if (!Array.isArray(refs) || !refs.length || !account || typeof account.ref !== 'string') return undefined;
+  for (let i = 0; i < refs.length; i++) {
+    if (refs[i] === account.ref) return { skip: true };
+  }
+  return undefined;
+}
 
 export const strategies = {
   'nearest-expiry': (pool, seats, options) => {
