@@ -341,7 +341,8 @@ function orderingSig(rows) {
   for (const row of rows) {
     if (row && row.x !== undefined) { parts.push('x'); continue; }
     if (!row || typeof row.r !== 'number') { parts.push('?'); continue; }
-    parts.push(`${row.r}:${row.o !== undefined ? 'o' : '-'}${row.d !== undefined ? 'd' : '-'}`);
+    parts.push(`${row.r}:${row.o !== undefined ? 'o' : '-'}${row.d !== undefined ? 'd' : '-'}` +
+      `${row.w !== undefined ? 'w' : '-'}${row.s !== undefined ? 's' : '-'}`);
   }
   return parts.join('|');
 }

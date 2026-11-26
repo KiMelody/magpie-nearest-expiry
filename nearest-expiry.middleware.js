@@ -244,16 +244,20 @@ export const strategies = {
     });
 
     // 正常候选里，最早到期后 BAND_MS 内的视作同一档，档内轮换一位，避免分钟级
-    // 差异把每轮对话钉在同一账号。轮换池只取 BAND 内、与头部同峰谷属性的子组：
-    // 同刻的 peak 账号排前（排序已保证），nonpeak 不会被轮换顶到它前面。
-    // 用 key 作锚点并区分峰谷属性，容忍候选增减，也避免两组轮换状态互相干扰。
+    // 差异把每轮对话钉在同一账号。轮换只在排序键除 soon/used 外都等价的候选间
+    // 进行：同日积分类优先(day8/credit)、同刻 7d 弱窗让位(weak)、峰谷价优先(peak)
+    // 都比分钟级差异更重要，不能被轮换顶掉。
+    // 用 key 作锚点并区分这些维度，容忍候选增减，也避免不同子组的轮换状态互相干扰。
     const normal = rank.filter((r) => r.group === 0 && !r.defer);
     if (normal.length > 1) {
-      const t0 = normal[0].soon;
-      const headPeak = normal[0].peak;
-      const rot = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS && r.peak === headPeak);
+      const lead = normal[0];
+      const t0 = lead.soon;
+      const rot = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS &&
+        r.day8 === lead.day8 && r.credit === lead.credit &&
+        r.weak === lead.weak && r.peak === lead.peak);
       if (rot.length > 1) {
-        const p = `${typeof pool === 'string' ? pool : ''}|${headPeak ? 'p' : 'n'}`;
+        const p = `${typeof pool === 'string' ? pool : ''}|${lead.peak ? 'p' : 'n'}|` +
+          `${lead.credit ? 'c' : 'f'}|${lead.weak ? 'w' : 's'}|${lead.day8}`;
         const last = cursors[p];
         let at = -1;
         if (typeof last === 'string') {
