@@ -71,7 +71,16 @@ function pluginSpec() {
   } catch {}
   return '';
 }
-function refName() { return pluginSpec(); }
+// magpie 的 plugin.Name(spec)：实测安装后为 package.json 的 name
+// （middleware-nearest-expiry），而非 git spec。优先读安装目录的 name，
+// 与 magpie 运行时一致；读不到再回退到 spec。
+function refName() {
+  try {
+    const pj = JSON.parse(readFileSync(join(DIR, 'package.json'), 'utf8'));
+    if (pj.name) return pj.name;
+  } catch {}
+  return pluginSpec();
+}
 const MIN_RUNSOUT = 10;
 const MIN_MS = 2 * 3600 * 1000;
 const MAX_MS = 30 * 86400 * 1000;

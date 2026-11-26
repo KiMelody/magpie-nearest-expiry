@@ -95,7 +95,7 @@ export function onAccount(account, ctx) {
   // 调试开关：options.debugRefs=true 时打印 (provider, ref)，用于首次核对
   // hooks 算出的 ref 与 magpie 实际值是否一致；核对后关闭。
   if (ctx && ctx.options && ctx.options.debugRefs && account && typeof account.ref === 'string' && console && typeof console.log === 'function') {
-    console.log(`[nearest-expiry] account ${account.provider}/${account.kind} ref=${account.ref}`);
+    console.log(`[nearest-expiry] account provider=${account.provider} name=${account.name} kind=${account.kind} model=${account.model} ref=${account.ref}`);
   }
   const refs = AUTO_SKIP.refs;
   if (!Array.isArray(refs) || !refs.length || !account || typeof account.ref !== 'string') return undefined;
