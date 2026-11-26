@@ -16,6 +16,8 @@
 
 会到点作废的月度额度按作废量处理：CodeArts 从 0.3.25 起把 runsOutAt/runsOut 挪到「总积分」、分项桶不再带，而「总积分/基础积分包」的月度余额当月用不完即作废，所以同步侧用它的 resetsAt 作到期键、remaining 作废量（o）进第一档优先烧；烧完当前批次后自动回落到这个月度窗，而不是写 x 停在第一档之外。opencode-go 的 Month 窗同理带 o；它的 7 days 窗带 w 标记，只在到期时刻与其他供应商完全相同时排后，时间更早时仍按精确时间排前。opendesign 的 7 days 窗到点用不完会连累整月，按普通到期窗参与排序。opencode-go 与 opendesign 的 5 小时速率窗到点只是刷新、剩余不结转也不亏，不参与第一档排序。
 
+订阅制窗（opencode-go/opendesign/commandcode 这类，remaining 是百分比、无计量单位）的额度不用就是亏，尾量同样进排序：这类窗豁免 MIN_RUNSOUT 绝对量阈值，账本打 s 标记，哪怕只剩 5% 也作为作废量 o 参与排序。积分类窗（积分/credits/points）继续按绝对量阈值过滤无价值尾量，每日签到窗按作废处理不算订阅制。
+
 插件 options 可按时段给供应商降权：`timeRules` 按前缀匹配 seat key，`days`（UTC+8 星期，0=周日）与 `windows`（`[["08:30","22:00"]]` 分钟级、左闭右开）命中时，该供应商排到同组末尾作为软降权，其他候选都不可用时仍可兜底。前缀按边界匹配，`workbuddy` 不会误伤 `workbuddy-ai`。若账号的有效排序键按 UTC+8 自然日算在 `deferDueDays`（默认 4）天内到期，则豁免降权保持正常使用，临期额度照常烧完。降权候选不参与同档轮换。注册表 `magpie.options` 给出默认值，可用 `magpie plugin options` 覆盖。
 
 有峰谷价的供应商由 `peakPricing` 列出，默认是 magpie 官方按小时计费的 4 类（deepseek、commandcode、opencode-go、ollama-cloud）加单独维护的 workbuddy。`peakPricing` 只影响精确到期时刻完全相同时的优先级：同刻让有峰谷价者优先，低谷期多用按峰谷计费的额度；低谷期的这条偏好只作用于同刻，不会越过更早到期的账号。有峰谷价的账号在 5 分钟同档里单独轮换，不会被无峰谷价的账号顶到前面。高峰降权由 `timeRules` 负责：workbuddy 沿用每天 08:30-22:00，opencode-go 对齐官方的 09:00-12:00、14:00-18:00，临期账号照常豁免。

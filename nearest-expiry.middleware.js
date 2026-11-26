@@ -176,7 +176,7 @@ export const strategies = {
           const e = book[w];
           if (!e || typeof e.r !== 'number' || e.r <= now) continue;
           if (e.r - now > HORIZON_MS) continue; // 长时效窗口：保留但不抢第一档
-          if (e.o && e.o < MIN_RUNSOUT) continue;
+          if (e.o && e.o < MIN_RUNSOUT && !e.s) continue; // 订阅制窗(s)的百分比尾量也进排序
           if (e.o || e.r - now <= URGENT_MS) liveBatch = true;
           if (!e.o && !e.d && e.r - now < skipMs) continue;
           if (soonMin === 0 || e.r < soonMin) {

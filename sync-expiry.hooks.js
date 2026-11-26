@@ -174,13 +174,17 @@ async function sync() {
           // 让它进第一档优先烧；7 days 标记为 weak，同刻到期时排其他供应商后。
           const isMonth = p.provider === 'opencode-go' && /^month$/i.test(name);
           const is7d = p.provider === 'opencode-go' && /7\s*days/i.test(name);
+          const daily = !w.runsOutAt && DAILY_WINDOW.test(name) && Number(w.remaining) > 0;
+          // 订阅制窗（opencode-go/opendesign 等，remaining 是百分比、无 unit）
+          // 的额度不用就是亏：尾量也进排序，豁免 MIN_RUNSOUT 阈值。
+          // 积分类窗（积分/credits/points）仍有绝对量阈值；签到窗(d)按作废处理，不算订阅制。
+          const subscription = !w.runsOutAt && !w.unit && !daily;
           return {
             at: w.runsOutAt || w.resetsAt,
             out: w.runsOutAt ? w.runsOut : (isMonth ? w.remaining : undefined),
             weak: is7d ? 1 : undefined,
-            // 每日签到限额给的是 resetsAt，语义上却是当天作废；仅对仍有余额的
-            // 重置型窗口打标记，让下游按会作废处理，不与真失效批次混拼。
-            daily: !w.runsOutAt && DAILY_WINDOW.test(name) && Number(w.remaining) > 0,
+            subscription: subscription || undefined,
+            daily,
           };
         });
     }
@@ -191,7 +195,9 @@ async function sync() {
       const dt = ms - now;
       if (dt > MAX_MS) continue;
       const o = c.out === undefined ? undefined : Number(c.out);
-      if (o !== undefined && Number.isFinite(o) && o < MIN_RUNSOUT) continue;
+      // 订阅制窗豁免 MIN_RUNSOUT：百分比尾量（如 opencode-go Month 剩 5%）
+      // 也是已付费额度，不用就亏；积分类窗仍按绝对量阈值过滤无价值尾量。
+      if (o !== undefined && Number.isFinite(o) && o < MIN_RUNSOUT && !c.subscription) continue;
       // 真失效批次(o)与每日签到窗(d)豁免 MIN_MS：临近失效时仍要保留，
       // 否则会从账本消失。重置型短窗仍需过 2h 保护，避免计数器/速率窗抢排序。
       if (dt < MIN_MS && !c.daily && (o === undefined || !Number.isFinite(o))) continue;
@@ -199,6 +205,7 @@ async function sync() {
       if (o !== undefined && Number.isFinite(o)) row.o = Math.round(o * 100) / 100;
       if (c.daily) row.d = 1;
       if (c.weak) row.w = 1;
+      if (c.subscription) row.s = 1;
       rows.push(row);
     }
     // 没有会作废/会到期的窗口时显式写耗尽占位：保持账本命中（屏蔽 seat 里
