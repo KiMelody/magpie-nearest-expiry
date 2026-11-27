@@ -82,6 +82,7 @@ function refName() {
   return pluginSpec();
 }
 const MIN_RUNSOUT = 10;
+const SMALL_WINDOW_MS = 24 * 3600 * 1000; // 短窗判定，与 middleware 的 SMALL_WINDOW_MS 一致
 const MIN_MS = 2 * 3600 * 1000;
 const MAX_MS = 30 * 86400 * 1000;
 
@@ -225,10 +226,6 @@ async function sync() {
   const lines = Object.keys(book).sort().map((k) => `  ${JSON.stringify(k)}: ${JSON.stringify(book[k])},`);
   // 空响应守卫：0 个有效账号时不写账本，避免一次刷新失败把已有账本清空。
   if (!lines.length) { log('no accounts, keep ledger'); return; }
-  // 生成跳过名单：只含 nearest-expiry 组里、限时额度已烧完（账本 x 占位）的账号。
-  // 整组耗尽时清空，避免所有候选被 skip 导致请求失败。
-  const skipRefs = buildSkipRefs(data.data, book);
-  const skipBlock = `/*AUTO-SKIP-BEGIN*/\n  "refs": ${JSON.stringify(skipRefs)}\n/*AUTO-SKIP-END*/`;
   // 块内不含时间戳：数据不变时 next === content，避免每次同步都热重载清零策略状态。
   const block = `/*AUTO-BOOK-BEGIN*/\n${lines.join('\n')}\n/*AUTO-BOOK-END*/`;
   let content;
@@ -236,15 +233,28 @@ async function sync() {
   const re = /\/\*AUTO-BOOK-BEGIN\*\/[\s\S]*?\/\*AUTO-BOOK-END\*\//;
   const skipRe = /\/\*AUTO-SKIP-BEGIN\*\/[\s\S]*?\/\*AUTO-SKIP-END\*\//;
   if (!re.test(content) || !skipRe.test(content)) { log('AUTO blocks not found'); return; }
+  // 生成跳过名单：x 耗尽账号 + 短窗刚耗尽交接事件 + 全组最优账号 ref。
+  // 整组耗尽时清空 skip，避免所有候选被 skip 导致请求失败。
+  const skipRefs = buildSkipRefs(data.data, book);
+  let prevSkipObj = null;
+  try {
+    const m = content.match(skipRe);
+    prevSkipObj = JSON.parse(`{${m[0].replace(/\/\*AUTO-SKIP-BEGIN\*\//, '').replace(/\/\*AUTO-SKIP-END\*\//, '').trim().replace(/,$/, '')}}`);
+  } catch (e) { prevSkipObj = null; }
+  const handoff = buildHandoffs(data.data, book, parseBlock(content), prevSkipObj);
+  const skipObj = { refs: skipRefs, handoffs: handoff.handoffs, bestRef: handoff.bestRef };
+  const skipBlock = `/*AUTO-SKIP-BEGIN*/\n  "refs": ${JSON.stringify(skipObj.refs)},\n` +
+    `  "handoffs": ${JSON.stringify(skipObj.handoffs)},\n` +
+    `  "bestRef": ${JSON.stringify(skipObj.bestRef)}\n/*AUTO-SKIP-END*/`;
   const bookSame = sameOrdering(parseBlock(content), book);
-  const skipSame = parseSkip(content) === JSON.stringify(skipRefs);
+  const skipSame = parseSkip(content) === JSON.stringify(skipObj);
   if (bookSame && skipSame) { log(`no change (${lines.length} accounts)`); return; }
   // 只有其中一个块变化时也写：整体替换 content，两个块都用新内容。
   let next = content;
   if (!bookSame) next = next.replace(re, block);
   if (!skipSame) next = next.replace(skipRe, skipBlock);
   try { atomicWrite(PLUGIN, next); } catch (e) { log(`write failed: ${e.message}`); return; }
-  log(`synced: ${lines.length} accounts, skip=${skipRefs.length}`);
+  log(`synced: ${lines.length} accounts, skip=${skipRefs.length}, handoffs=${handoff.handoffs.length}`);
 }
 
 // 提取排序语义签名：r 时刻精确比较；o/d/x 只看存在性，数值不参与排序。
@@ -284,15 +294,81 @@ function nearestGroups() {
   return groups;
 }
 
-// 解析现有 skip 块，供等价判断使用
+// 解析现有 skip 块，供等价判断使用（整体结构比较，含 handoffs/bestRef）
 function parseSkip(text) {
   const m = text.match(/\/\*AUTO-SKIP-BEGIN\*\/([\s\S]*?)\/\*AUTO-SKIP-END\*\//);
   if (!m) return null;
-  try { return JSON.stringify(JSON.parse(`{${m[1].trim().replace(/,$/, '')}}`).refs || []); } catch { return null; }
+  try {
+    const o = JSON.parse(`{${m[1].trim().replace(/,$/, '')}}`);
+    return JSON.stringify({ refs: o.refs || [], handoffs: o.handoffs || [], bestRef: o.bestRef || '' });
+  } catch { return null; }
 }
 
 // 生成要跳过的账号 ref。dataRows 是 /v1/magpie/quotas 的 data[]，book 是本次账本。
 // 只处理账本写 x（限时额度烧完）且属于 nearest-expiry 组的账号。
+// 短窗耗尽交接：对比新旧账本，账号最早窗从短窗(d 或 24h 内 o)变成非短窗时，
+// 记一个带时间戳的事件。事件保留 HANDOFF_TTL_MS，过期自动消失。
+// 同时算出当前全组最早窗账号的 ref（bestRef），供 onAccount 一次比较判断要不要切走。
+const HANDOFF_TTL_MS = 10 * 60 * 1000;
+function earliestWindow(rows, now) {
+  let best = null;
+  if (!Array.isArray(rows)) return null;
+  for (const r of rows) {
+    if (!r || typeof r.r !== 'number' || r.r <= now) continue;
+    if (!best || r.r < best.r) best = r;
+  }
+  return best;
+}
+function isShortWindow(e, now) {
+  if (!e || typeof e.r !== 'number') return false;
+  return !!e.d || (typeof e.o === 'number' && e.r - now <= SMALL_WINDOW_MS);
+}
+function buildHandoffs(dataRows, book, prevBook, prevSkip) {
+  const key = readRefKey();
+  if (!key) return { handoffs: [], bestRef: '' };
+  const groups = nearestGroups();
+  if (!groups.length) return { handoffs: [], bestRef: '' };
+  const nearestSet = new Set();
+  for (const g of groups) for (const p of g) nearestSet.add(p);
+  const now = Date.now();
+  const accounts = [];
+  for (const row of (Array.isArray(dataRows) ? dataRows : [])) {
+    const p = String(row.provider || '');
+    if (!nearestSet.has(p)) continue;
+    accounts.push({ provider: p, user: row.user, plan: row.plan });
+  }
+  const firstSeen = new Set();
+  const entries = [];
+  for (const a of accounts) {
+    const first = !firstSeen.has(a.provider);
+    firstSeen.add(a.provider);
+    const bk = first || !a.user ? a.provider : `${a.provider}@${a.user}`;
+    entries.push({ a, bk, ref: accountRef(key, a.user, a.plan) });
+  }
+  // 保留未过期的旧事件；时间戳稳定，避免每次同步都热重载
+  const handoffs = [];
+  for (const h of (prevSkip && Array.isArray(prevSkip.handoffs) ? prevSkip.handoffs : [])) {
+    if (h && typeof h.at === 'number' && now - h.at <= HANDOFF_TTL_MS) handoffs.push(h);
+  }
+  const knownRefs = new Set(handoffs.map((h) => h.ref));
+  // 检测新发生的短窗耗尽
+  for (const e of entries) {
+    if (knownRefs.has(e.ref)) continue;
+    const prev = earliestWindow(prevBook && prevBook[e.bk], now);
+    const cur = earliestWindow(book[e.bk], now);
+    if (isShortWindow(prev, now) && cur && !isShortWindow(cur, now)) {
+      handoffs.push({ ref: e.ref, key: e.bk, at: now });
+    }
+  }
+  // bestRef：当前全组最早窗账号的 ref
+  let bestRef = ''; let bestAt = Infinity;
+  for (const e of entries) {
+    const w = earliestWindow(book[e.bk], now);
+    if (w && w.r < bestAt) { bestAt = w.r; bestRef = e.ref; }
+  }
+  return { handoffs, bestRef };
+}
+
 function buildSkipRefs(dataRows, book) {
   const key = readRefKey();
   if (!key) { log('ref key not ready, skip list empty'); return []; }

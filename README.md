@@ -42,6 +42,8 @@ With `stays=turn`, magpie promotes the last responder to the front of the candid
 
 Only accounts in groups routed by `nearest-expiry/nearest-expiry` are skipped; other strategies are untouched. An exhausted account is kept when every group it belongs to has no other usable account, so skipping cannot leave a request with no candidate. The ref is magpie's anonymous account identifier; the hooks derive it with the same HMAC-SHA256 as magpie's source, from `account-ref.key`, `user` and `plan`. Before the key exists the skip list is empty and fills in on the next sync after the first `onAccount` creates it. To check the mapping once, set the `debugRefs` option to true and the log prints each account's `(provider, ref)`.
 
+When a small window (a daily check-in or a sub-24-hour credit batch) burns out on a multi-window account, that account would otherwise keep its turn stickiness and spend the remaining long-lived window. The hooks compare each account's earliest window between syncs and record a handoff event when a short window becomes a long one, together with the ref of the account that currently holds the group's earliest expiry. `onAccount` skips a handed-off account for up to ten minutes only when another account is the earliest and its own next window is more than 16 hours out, so a long turn moves to a more urgent seat. If the account is itself the earliest, or its remaining window is already near due, it is kept and continues on the same account without losing cache warmth. The decision reads the precomputed best ref plus a single ledger lookup, so it adds no per-request sort work.
+
 ## Install
 
 ```bash

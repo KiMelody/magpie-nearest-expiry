@@ -97,7 +97,9 @@ const AUTO_BOOK = {
 // 在同一长回合内也绕过该账号（turn 粘性会把策略排末尾的账号强制提到首位）。
 const AUTO_SKIP = {
 /*AUTO-SKIP-BEGIN*/
-  "refs": []
+  "refs": [],
+  "handoffs": [],
+  "bestRef": ""
 /*AUTO-SKIP-END*/
 };
 
@@ -109,10 +111,35 @@ export function onAccount(account, ctx) {
   if (ctx && ctx.options && ctx.options.debugRefs && account && typeof account.ref === 'string' && console && typeof console.log === 'function') {
     console.log(`[nearest-expiry] account provider=${account.provider} name=${account.name} kind=${account.kind} model=${account.model} ref=${account.ref}`);
   }
+  let now = 0;
+  try { now = Date.now(); } catch (e) { now = 0; }
   const refs = AUTO_SKIP.refs;
-  if (!Array.isArray(refs) || !refs.length || !account || typeof account.ref !== 'string') return undefined;
-  for (let i = 0; i < refs.length; i++) {
-    if (refs[i] === account.ref) return { skip: true };
+  if (!account || typeof account.ref !== 'string') return undefined;
+  if (Array.isArray(refs)) {
+    for (let i = 0; i < refs.length; i++) {
+      if (refs[i] === account.ref) return { skip: true };
+    }
+  }
+  // 短窗刚耗尽交接：若别人是当前最优、且该账号剩余最早窗不临期(>16h)，
+  // 则 skip 一次让它切走；若它自己最优或长窗已临期，放行（短接长，缓存不丢）。
+  const handoffs = AUTO_SKIP.handoffs;
+  if (Array.isArray(handoffs) && handoffs.length) {
+    let matched = null;
+    for (let i = 0; i < handoffs.length; i++) {
+      if (handoffs[i] && handoffs[i].ref === account.ref) { matched = handoffs[i]; break; }
+    }
+    if (matched && account.ref !== AUTO_SKIP.bestRef &&
+        typeof matched.at === 'number' && now - matched.at <= 10 * 60 * 1000) {
+      const rows = typeof matched.key === 'string' ? AUTO_BOOK[matched.key] : null;
+      let soonest = Infinity;
+      if (Array.isArray(rows)) {
+        for (let i = 0; i < rows.length; i++) {
+          const e = rows[i];
+          if (e && typeof e.r === 'number' && e.r > now && e.r < soonest) soonest = e.r;
+        }
+      }
+      if (soonest === Infinity || soonest - now > NEAR_DUE_MS) return { skip: true };
+    }
   }
   return undefined;
 }
