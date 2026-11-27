@@ -21,6 +21,12 @@ const MIN_RUNSOUT = 10; // 小于此量的过期批次按已烧完处理，避�
 const HORIZON_MS = 30 * 86400 * 1000; // 30 天外的长时效窗口不参与第一档，避免快用完的账号被拉到前面
 const URGENT_MS = 48 * 3600 * 1000; // 48h 内到期的窗口（含 d 签到）与 o 批次一样豁免 spent
 const BAND_MS = 5 * 60 * 1000; // 到期时间相差 5 分钟内视作同一档，档内轮换
+const NEAR_DUE_MS = 16 * 3600 * 1000; // 距到期不足 16h 的有峰谷账号无视峰谷、按到期优先烧
+const SMALL_WINDOW_MS = 24 * 3600 * 1000; // 带 o 且 24h 内到期的批次算小窗口，与 d 签到窗同等待遇
+// 全局峰价口径：工作日 09:00-12:00、14:00-18:00（opencode-go 口径）。
+// workbuddy 例外，用每天 08:30-22:00，命中时覆盖全局判定。
+const GLOBAL_PEAK_WINDOW = { days: [1, 2, 3, 4, 5], windows: [['09:00', '12:00'], ['14:00', '18:00']] };
+const WORKBUDDY_PEAK_WINDOW = { days: [0, 1, 2, 3, 4, 5, 6], windows: [['08:30', '22:00']] };
 const TZ8_MS = 8 * 3600 * 1000; // UTC+8 偏移
 // 前缀边界匹配：workbuddy 不能误伤 workbuddy-ai；key 为前缀本身或前缀后跟 @/: 才算命中
 function prefixHit(key, prefix) {
@@ -60,6 +66,12 @@ function dayDiff8(now, targetMs) {
     const y1 = Date.UTC(tgt.getUTCFullYear(), tgt.getUTCMonth(), tgt.getUTCDate());
     return Math.round((y1 - y0) / 86400000);
   } catch (e) { return 9999; }
+}
+// 当前时刻是否为该账号的峰价时段：workbuddy 用自己的 08:30-22:00 口径，其余用全局工作日口径。
+function peakHourFor(key, local) {
+  if (local.day < 0) return false;
+  if (prefixHit(key, 'workbuddy')) return inWindow(local, WORKBUDDY_PEAK_WINDOW);
+  return inWindow(local, GLOBAL_PEAK_WINDOW);
 }
 // 按 pool 记住档内上一次选中的 key；模块常驻，热重载会清零（额度数据变了本就该重排）。
 const cursors = {};
@@ -227,11 +239,38 @@ export const strategies = {
       for (let p = 0; p < peakList.length; p++) {
         if (prefixHit(key, peakList[p])) { peak = true; break; }
       }
+      // 峰谷调度：小窗口 = d 签到窗或 24h 内到期的 o 批次；这类额度计价固定，
+      // 留到峰价时段用最划算。谷价时段让有峰谷价账号优先，把小窗口压后。
+      // 但任何账号距到期不足 NEAR_DUE_MS 时进入临期保护，无视峰谷按到期烧。
+      let smallWindow = false;
+      if (book && book.length && now > 0) {
+        for (let w = 0; w < book.length; w++) {
+          const e = book[w];
+          if (!e || typeof e.r !== 'number' || e.r <= now) continue;
+          if (e.d || (e.o && e.r - now <= SMALL_WINDOW_MS)) { smallWindow = true; break; }
+        }
+      }
+      const remain = soonMin > 0 && now > 0 ? soonMin - now : Infinity;
+      const protect = remain <= NEAR_DUE_MS; // 临期保护：无视峰谷，按到期优先
+      const peakNow = peakHourFor(key, local); // 当前是否峰价时段（workbuddy 单独口径）
+      // peakRank 越小越优先，用统一四级尺度反映"当前用这个账号划不划算"：
+      //   0 谷价用峰谷账号（最省）/ 临期保护（无视峰谷）
+      //   1 峰价用无峰谷账号
+      //   2 谷价用无峰谷账号
+      //   3 峰价用峰谷账号（最贵，最该排后）
+      //   4 谷价时的小窗口（留到峰价用最划算，压到队尾）
+      let peakRank;
+      if (protect) peakRank = 0; // 临期保护：无视峰谷，按到期优先
+      else if (peakNow) peakRank = peak ? 3 : 1; // 峰价：无峰谷账号优先
+      else peakRank = peak ? 0 : (smallWindow ? 4 : 2); // 谷价：峰谷账号优先，小窗口压后
       rank.push({ i: i, group: group, soon: soonMin, day8: day8, credit: sortIsCredit,
-        weak: sortIsWeak, defer: defer, peak: peak, used: typeof s.used === 'number' ? s.used : 0, key: key });
+        weak: sortIsWeak, defer: defer, peak: peak, used: typeof s.used === 'number' ? s.used : 0,
+        protect: protect, peakRank: peakRank, key: key });
     }
     rank.sort((a, b) => {
       if (a.group !== b.group) return a.group - b.group;
+      if (a.protect !== b.protect) return a.protect ? -1 : 1; // 临期保护：无视峰谷，先烧
+      if (a.peakRank !== b.peakRank) return a.peakRank - b.peakRank; // 峰谷时段偏好
       if (a.defer !== b.defer) return a.defer ? 1 : -1; // 时段降权：非降权者优先
       if (a.day8 > 0 && a.day8 === b.day8 && a.credit !== b.credit) {
         return a.credit ? -1 : 1; // 同一天：积分类先用
@@ -254,10 +293,12 @@ export const strategies = {
       const t0 = lead.soon;
       const rot = normal.filter((r) => r.soon >= t0 && r.soon - t0 <= BAND_MS &&
         r.day8 === lead.day8 && r.credit === lead.credit &&
-        r.weak === lead.weak && r.peak === lead.peak);
+        r.weak === lead.weak && r.peak === lead.peak &&
+        r.protect === lead.protect && r.peakRank === lead.peakRank);
       if (rot.length > 1) {
         const p = `${typeof pool === 'string' ? pool : ''}|${lead.peak ? 'p' : 'n'}|` +
-          `${lead.credit ? 'c' : 'f'}|${lead.weak ? 'w' : 's'}|${lead.day8}`;
+          `${lead.credit ? 'c' : 'f'}|${lead.weak ? 'w' : 's'}|${lead.day8}|` +
+          `${lead.protect ? 't' : '-'}|${lead.peakRank}`;
         const last = cursors[p];
         let at = -1;
         if (typeof last === 'string') {
